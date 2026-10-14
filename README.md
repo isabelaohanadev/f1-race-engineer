@@ -229,7 +229,11 @@ erDiagram
         int tyre_life
         int stint
         int position
-        timestamptz completed_at
+        timestamptz completed_at "nulo em --laps-only"
+        bool pit_in "a volta termina nos boxes"
+        bool pit_out "a volta começa nos boxes"
+        string track_status "códigos de pista: 1, 12, 124..."
+        int session_time_ms "relógio da sessão no fim da volta"
     }
     POSITION_SAMPLES {
         int race_id PK, FK
@@ -280,6 +284,12 @@ Documentação interativa (Swagger) em <http://localhost:8000/docs>.
 # reaproveitam o cache.
 docker compose run --rm app python -m ingestion --year 2024 --round 21
 curl -s "localhost:8000/races/2024/21/laps?driver=VER" | head -c 600
+
+# Só voltas e resultado, sem a telemetria de posição: ~10 s em vez de minutos e sem as ~800 mil
+# linhas de posição. A corrida fica sem trajetória (sem replay de posições) e sem o horário absoluto
+# das voltas (`completed_at`), que o FastF1 só calcula com a telemetria; as colunas e os horários que
+# já estiverem no banco não são tocados. Serve à análise de estratégia, que só usa voltas.
+docker compose run --rm app python -m ingestion --year 2024 --round 6 --laps-only
 ```
 
 ### 4. Iniciar o replay e assistir

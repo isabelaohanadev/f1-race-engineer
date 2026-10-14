@@ -61,7 +61,9 @@ def write_race(
     driver_ids = _upsert_drivers(conn, data.entries)
 
     entries_changed = _upsert_entries(conn, race_id, data.entries, driver_ids, team_ids)
-    laps_offered, laps_changed = _upsert_laps(conn, race_id, data.laps, driver_ids)
+    laps_offered, laps_changed = _upsert_laps(
+        conn, race_id, data.laps, driver_ids, keep_completed_at=data.laps_only
+    )
     offered, inserted, skipped = _insert_positions(
         conn, race_id, data.tracks, driver_ids, chunk_size
     )
@@ -161,10 +163,33 @@ def _upsert_entries(
     return _execute_count(conn, stmt)
 
 
+LAP_FIELDS = (
+    "lap_time_ms",
+    "compound",
+    "tyre_life",
+    "stint",
+    "position",
+    "completed_at",
+    "pit_in",
+    "pit_out",
+    "track_status",
+    "session_time_ms",
+)
+
+
 def _upsert_laps(
-    conn: Connection, race_id: int, laps: Sequence[LapInfo], driver_ids: dict[str, int]
+    conn: Connection,
+    race_id: int,
+    laps: Sequence[LapInfo],
+    driver_ids: dict[str, int],
+    *,
+    keep_completed_at: bool = False,
 ) -> tuple[int, int]:
-    fields = ("lap_time_ms", "compound", "tyre_life", "stint", "position", "completed_at")
+    # `keep_completed_at` (ingestão --laps-only): a coluna fica FORA do INSERT e do UPDATE. Sem
+    # telemetria não há t0_date, então o valor nulo que o loader traz não significa "a volta não tem
+    # horário", e gravá-lo apagaria os horários que uma ingestão completa anterior já deixou lá (o
+    # replay depende deles). Volta nova entra com completed_at nulo (o default da coluna).
+    fields = tuple(f for f in LAP_FIELDS if not (keep_completed_at and f == "completed_at"))
     # Dict pela chave natural: se o FastF1 mandasse a mesma volta duas vezes, ficaria a última.
     rows: dict[tuple[int, int], dict[str, Any]] = {}
     for lap in laps:

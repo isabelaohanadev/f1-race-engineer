@@ -14,6 +14,12 @@ Brasil 2024 (e que explica várias linhas abaixo):
 * NaN aparece em LapTime (voltas de largada/box), Position, Stint e TyreLife; e inteiros vêm como
   float. Tudo é normalizado para int | None. Nas posições, amostras com data ou coordenada nula
   são descartadas (não há como gravá-las).
+* (Fase 3) `t0_date` só existe com a telemetria carregada (o FastF1 o deduz das amostras de posição
+  e de carro). Por isso o `--laps-only` não tem horário absoluto das voltas, só o relógio da sessão.
+* (Fase 3) Entrada e saída dos boxes vêm como INSTANTES (PitInTime/PitOutTime, nulos nas demais
+  voltas) e guardamos só o fato (bool). Metade dessas voltas TEM tempo de volta (no Brasil: 17 das
+  36 de entrada e 16 das 35 de saída), então "volta sem tempo" não identifica volta de box.
+  TrackStatus é uma string de códigos ("1", "12", "124"...) com tudo o que ocorreu na volta.
 """
 
 import logging
@@ -30,18 +36,27 @@ logger = logging.getLogger(__name__)
 SESSION_TYPE = "R"  # só a corrida (não sprint, qualy, treinos)
 
 
-def load_race(year: int, round_number: int, cache_dir: str) -> RaceData:
-    """Baixa (ou lê do cache em disco) e converte a corrida. Lento na 1ª vez: dezenas de MB."""
+def load_race(year: int, round_number: int, cache_dir: str, *, laps_only: bool = False) -> RaceData:
+    """Baixa (ou lê do cache em disco) e converte a corrida. Lento na 1ª vez: dezenas de MB.
+
+    `laps_only=True` pula a telemetria de posição (a parte pesada: ~800 mil amostras por corrida,
+    ~75 MB no banco) e devolve `tracks` vazio. Serve a quem só precisa de voltas e resultado, como a
+    estratégia da Fase 3 (medido: ~7 a 14 s por corrida, contra minutos). A corrida fica SEM
+    trajetória, então o replay dela não terá eventos de posição.
+    """
     # O FastF1 exige que a pasta exista. O cache evita rebaixar tudo a cada execução.
     os.makedirs(cache_dir, exist_ok=True)
     fastf1.Cache.enable_cache(cache_dir)
 
     session = fastf1.get_session(year, round_number, SESSION_TYPE)
     # telemetry=True traz posição (pos_data). O FastF1 não permite carregar só a posição.
-    session.load(laps=True, telemetry=True, weather=False, messages=False)
+    session.load(laps=True, telemetry=not laps_only, weather=False, messages=False)
 
-    t0 = session.t0_date
-    if t0 is None:
+    # `t0_date` (o zero que converte o relógio da sessão em horário UTC) o FastF1 calcula A PARTIR
+    # da telemetria: sem ela, ler `session.t0_date` levanta DataNotLoadedError. Em `laps_only` não
+    # há horário absoluto; fica só o relógio da sessão (`session_time_ms`), que não precisa dele.
+    t0 = None if laps_only else session.t0_date
+    if not laps_only and t0 is None:
         raise RuntimeError(f"FastF1 não conseguiu determinar t0_date de {year} R{round_number}")
 
     entries = _build_entries(session.results)
@@ -51,7 +66,9 @@ def load_race(year: int, round_number: int, cache_dir: str) -> RaceData:
         race=_build_race(session, year, round_number),
         entries=entries,
         laps=_build_laps(session.laps, t0),
-        tracks=_build_tracks(session.pos_data, code_by_number),
+        # Sem telemetria carregada, `session.pos_data` levanta DataNotLoadedError: nem tocamos nele.
+        tracks=[] if laps_only else _build_tracks(session.pos_data, code_by_number),
+        laps_only=laps_only,
     )
 
 
@@ -108,11 +125,13 @@ def _build_entries(results: pd.DataFrame) -> list[EntryInfo]:
     return entries
 
 
-def _build_laps(laps: pd.DataFrame, t0: pd.Timestamp) -> list[LapInfo]:
+def _build_laps(laps: pd.DataFrame, t0: pd.Timestamp | None) -> list[LapInfo]:
+    """`t0` nulo = sem telemetria (`laps_only`): `completed_at` sai nulo, o resto não muda."""
     out = []
     for lap in laps.itertuples(index=False):
         lap_time = None if pd.isna(lap.LapTime) else round(lap.LapTime.total_seconds() * 1000)
-        completed_at = None if pd.isna(lap.Time) else _to_utc(t0 + lap.Time)
+        completed_at = None if t0 is None or pd.isna(lap.Time) else _to_utc(t0 + lap.Time)
+        session_time = None if pd.isna(lap.Time) else round(lap.Time.total_seconds() * 1000)
         out.append(
             LapInfo(
                 driver_code=str(lap.Driver),
@@ -123,6 +142,12 @@ def _build_laps(laps: pd.DataFrame, t0: pd.Timestamp) -> list[LapInfo]:
                 stint=_int_or_none(lap.Stint),
                 position=_int_or_none(lap.Position),
                 completed_at=completed_at,
+                # Presença do instante = a volta tem entrada/saída dos boxes. Sempre True/False
+                # (nunca None): o FastF1 informa os dois para toda volta.
+                pit_in=not pd.isna(lap.PitInTime),
+                pit_out=not pd.isna(lap.PitOutTime),
+                track_status=_str_or_none(lap.TrackStatus),
+                session_time_ms=session_time,
             )
         )
     return out
