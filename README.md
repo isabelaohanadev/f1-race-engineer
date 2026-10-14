@@ -328,6 +328,12 @@ E quais corridas entram no backtest principal e quais ficam à parte:
 python -m strategy.population
 ```
 
+E o modelo de degradação, com a calibração e as corridas à parte, em `docs/degradacao.md`:
+
+```bash
+python -m strategy.degradation --markdown docs/degradacao.md
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -586,6 +592,7 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **`k` estimado junto com a degradação, com intercepto por piloto (não por stint)** | Dentro de um stint `volta = idade + constante`: com intercepto por stint o `k` é absorvido pela inclinação da idade e só se identifica `degradação - k`. O que os separa é comparar stints que começam em voltas diferentes, nos vários pilotos da corrida. |
 | **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. **Não foi apertado** depois: virou a variante `estimado` do backtest. |
 | **`k` com encolhimento contínuo, e as três variantes comparadas no backtest** | `k = w * estimado + (1 - w) * físico`, em vez de trocar de fonte num ponto da corrida (um degrau em `k` passa 1 para 1 para a degradação). `w = paradas_vistas/pilotos (no máximo 1) * precisão`; o estimado entra limitado a 0,5x..2x do físico e o erro-padrão é o maior entre o por cluster e o do jackknife por piloto. Só usa voltas até a volta N (testado corrompendo o futuro). `fisico`, `estimado` e `encolhimento` são variantes do backtest da etapa 8, e os números decidem o padrão. |
+| **Degradação por composto e por piloto, com encolhimento e três incertezas separadas** | Um piloto com 8 voltas num composto tem uma inclinação de erro enorme; a média do composto na corrida (de ~20 pilotos) é estável, mas não é "dele". O encolhimento normal-normal pesa as duas pela precisão (`B = t²/(t²+se²)`): com pouco dado vale o composto, com muito vale o piloto. As incertezas saem separadas: `se` (do parâmetro, cai com dados), `σ` (ruído de UMA volta, não cai) e `τ` (variação real da inclinação entre pilotos/stints, estimada pelos próprios dados). Para prever um stint **futuro** vale `sqrt(se² + τ²)`; só com `se` o alerta de undercut ficaria confiante demais. |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
 | **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
 | **Backtest principal só com corridas secas; as demais à parte** | Em pista molhada, ou que seca durante a corrida, o tempo cai por causa da pista e o modelo "descobre" degradação negativa: medir o erro nelas mediria o clima. O principal usa as 21 corridas com 99% ou mais das voltas em pneu de seco. A **corrida britânica** (76% seca, pista secando) é a que mais tentaria entrar por engano e fica à parte, junto com o Canadá e o Brasil (molhadas). |
@@ -632,6 +639,37 @@ Resultado final: o maior passo entre voltas consecutivas é menor que o da regra
 corridas** (mediana 0,010 contra 0,024 s/volta, máximo 0,035 contra 0,051), empata em 2 e é pior em 1
 (Mônaco). O `k` ao fim da corrida é praticamente o da regra, exceto onde o estimado diverge (Mônaco:
 1,98x contra 1,00x do físico) e onde a identificação é fraca (Catar).
+
+#### O modelo de degradação: o que medi
+
+Nas 21 corridas secas (`docs/degradacao.md`), ajustado com a corrida inteira:
+
+- **Ruído de volta σ**: mediana 0,32 s. **Variação entre pilotos/stints τ**: mediana 0,022 s por volta de
+  idade (de 0,010 a 0,073).
+- **Calibração com stints que ainda não aconteceram** (os que começam depois de 50% da corrida, 251
+  stints, previstos com o modelo cortado em 50%): o intervalo de 95% **só com o erro-padrão cobre 66%**
+  da inclinação real. **Com a variação τ cobre 91%**. Se o erro do `k` também entra (a inclinação real
+  medida com o `k` da corrida inteira), 87%. O alvo é 95%: a separação das incertezas ajuda muito, e
+  ainda assim o intervalo fica **um pouco estreito**.
+- **Por tipo de previsão**: piloto 93%, composto 94%, e **"todos os compostos" 68%** (n=19). O último é o
+  caso em que ninguém rodou o composto e se usa a média dos outros; previsões com `source` igual a
+  `todos os compostos` **não devem sustentar um alerta**.
+- **Dois defeitos meus que a medição expôs**: (1) o erro-padrão da inclinação por stint (HC1) saía
+  pequeno demais para stints curtos: o intervalo de 95% cobria 75% com 6 voltas, 81% com 8 e 88% com 12
+  (simulação). Troquei para HC3, corrigido pela alavancagem: com a t de Student cobre 92% com 6 a 8
+  voltas e 95% com 25 ou mais; abaixo de 12 voltas ele ainda é um pouco curto. (2) O último recurso
+  tratava SOFT e HARD como se degradassem igual (cobertura 63%); o piso para a diferença entre
+  compostos o levou a 68%, e foi tudo o que consegui sem inventar uma causa: nas corridas em que ele
+  falha (Arábia Saudita e Catar) os dois compostos conhecidos são quase iguais e o SOFT que ninguém
+  rodou degradou muito mais.
+- **O erro-padrão por stint não é o problema da cobertura que sobra.** A autocorrelação lag-1 dos
+  resíduos dentro dos stints é 0,20 (mediana de 825 stints) e o erro-padrão que uso (HC3) é 1,36x o
+  de voltas independentes, acima da inflação que essa autocorrelação pede (1,23x). A causa do déficit
+  restante **não foi identificada**.
+- **Duas constantes saem destes dados**: `TAU_FALLBACK` (0,022, a mediana de τ, usada quando a corrida
+  ainda não tem dados para estimá-lo) e `BETWEEN_COMPOUNDS_FLOOR` (0,017, a mediana do desvio entre as
+  médias dos compostos). Um backtest estrito deveria recalculá-las sem a corrida testada.
+
 
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
@@ -720,6 +758,12 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 - **No primeiro quarto da corrida o `k` é praticamente o físico.** O peso mediano do estimado é 0,01
   com dados até 25% da corrida, 0,74 até 50% e 0,98 até 75%: antes das primeiras paradas não há dado
   que identifique o `k`, e o físico (a suposição de 0,03 s/kg) é o que vale.
+- **A incerteza da degradação ainda é um pouco estreita.** O intervalo de 95% para um stint futuro
+  cobre 91% (87% se o erro do `k` entra), não 95%; um undercut que a use deve ler `predictive_sd` como
+  piso, não como teto. `τ` mistura diferença entre pilotos e entre stints do mesmo piloto, então
+  `predictive_sd` é conservador num sentido e curto em outro, e a causa do déficit não foi identificada.
+- **Stints curtos (6 a 8 voltas) ainda têm erro-padrão ~8% curto** (cobertura 92%, mesmo com HC3 e
+  t de Student), e o Huber, com tão poucas voltas, pode tratar como outlier uma volta que é só ruído.
 - **0,03 s/kg não foi validado de forma independente.** É uma suposição de engenharia; os dados só
   dizem que o `k` total (combustível + pista) é parecido com ele em 20 de 21 corridas, o que não
   prova que o combustível sozinho vale isso.
@@ -763,7 +807,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade, limpeza, população, regressão, combustível (puro)
+strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação (puro)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

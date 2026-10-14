@@ -6,7 +6,7 @@ A resposta certa é plantada nos dados: se o estimador não a recupera, o defeit
 import numpy as np
 import pytest
 
-from strategy.regression import HUBER_K, fit_linear, one_hot, t_critical_95
+from strategy.regression import HUBER_K, fit_linear, fit_within, one_hot, t_critical_95
 
 
 def design(rng: np.random.Generator, n: int = 400) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -202,3 +202,114 @@ def test_one_hot_with_a_single_label_and_drop_first_has_no_columns():
     matrix, names = one_hot(["SOFT", "SOFT"], drop_first=True)
 
     assert matrix.shape == (2, 0) and names == []
+
+
+# ----------------------------------------------------------------- fit_within (por stint)
+
+
+def stints(rng, n_stints=12, laps=15, slope=0.07, noise=0.2, level_sd=3.0, level_trend=0.0):
+    """Stints com níveis de ritmo MUITO diferentes entre si e a mesma inclinação: o que se quer é a
+    inclinação dentro do stint, sem que a diferença de nível a contamine."""
+    x, y, g = [], [], []
+    for s in range(n_stints):
+        start = int(rng.integers(1, 20))
+        level = 90 + level_trend * start + rng.normal(0, level_sd)
+        for k in range(laps):
+            x.append(start + k)
+            y.append(level + slope * (start + k) + rng.normal(0, noise))
+            g.append(s)
+    return np.array(x, float), np.array(y), g
+
+
+def test_within_slope_ignores_the_level_differences_between_groups():
+    x, y, g = stints(np.random.default_rng(1))
+
+    fit = fit_within(x, y, g)
+
+    assert fit.slope == pytest.approx(0.07, abs=3 * fit.se)
+    assert fit.n_groups == 12 and fit.n_obs == len(x)
+
+
+def test_a_plain_regression_would_be_wrecked_by_level_differences_tied_to_the_start_lap():
+    """Premissa do teste anterior. No uso real, quem larga o stint mais tarde tem o carro mais leve
+    (nível mais baixo): sem o intercepto por grupo isso vira uma inclinação falsa."""
+    x, y, g = stints(np.random.default_rng(1), level_trend=-0.5)
+
+    naive = np.polyfit(x, y, 1)[0]
+    within = fit_within(x, y, g)
+
+    assert naive < 0 < within.slope  # o ajuste ingênuo inverte até o SINAL do desgaste
+    assert within.slope == pytest.approx(0.07, abs=3 * within.se)
+
+
+def test_within_slope_is_exact_without_noise():
+    x = np.array([1, 2, 3, 4, 10, 11, 12, 13], float)
+    y = 0.05 * x + np.array([100, 100, 100, 100, 50, 50, 50, 50.0])
+
+    fit = fit_within(x, y, [0, 0, 0, 0, 1, 1, 1, 1])
+
+    assert fit.slope == pytest.approx(0.05) and fit.sigma == pytest.approx(0, abs=1e-9)
+
+
+def test_within_slope_resists_late_outliers_where_ordinary_fitting_does_not():
+    rng = np.random.default_rng(2)
+    x, y, g = stints(rng, n_stints=20)
+    late = np.flatnonzero(x > np.quantile(x, 0.8))
+    y[rng.choice(late, 12, replace=False)] += 6.0  # tráfego no fim dos stints
+
+    robust = fit_within(x, y, g)
+    plain = fit_within(x, y, g, huber_k=None)
+
+    assert abs(plain.slope - 0.07) > 0.01
+    assert abs(robust.slope - 0.07) < abs(plain.slope - 0.07) / 3
+
+
+def test_within_interval_covers_the_truth_about_95_percent_of_the_time_for_independent_laps():
+    rng = np.random.default_rng(3)
+    hits, runs = 0, 400
+    for _ in range(runs):
+        x, y, g = stints(rng, n_stints=6, laps=12)
+        fit = fit_within(x, y, g)
+        hits += abs(fit.slope - 0.07) <= 1.96 * fit.se
+
+    assert 0.90 <= hits / runs <= 0.99
+
+
+def test_within_noise_is_the_lap_to_lap_scatter_and_does_not_shrink_with_more_stints():
+    """O `sigma` é o ruído de UMA volta; o `se` é a incerteza da inclinação. Com 4x mais stints o
+    segundo cai pela metade e o primeiro fica onde estava."""
+    few = fit_within(*stints(np.random.default_rng(4), n_stints=5, noise=0.3))
+    many = fit_within(*stints(np.random.default_rng(5), n_stints=20, noise=0.3))
+
+    assert few.sigma == pytest.approx(0.3, rel=0.2) and many.sigma == pytest.approx(0.3, rel=0.2)
+    assert many.se < 0.65 * few.se
+
+
+def test_within_slope_is_not_identified_when_x_does_not_vary_inside_any_group():
+    fit = fit_within(np.array([5.0, 5.0, 9.0, 9.0]), np.array([1.0, 2.0, 3.0, 4.0]), [0, 0, 1, 1])
+
+    assert fit.slope is None and fit.se is None and fit.sigma is None
+
+
+def test_within_slope_with_only_singleton_groups_is_not_identified():
+    fit = fit_within(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0]), [0, 1, 2])
+
+    assert fit.slope is None and fit.n_groups == 0
+
+
+def test_within_standard_error_is_undefined_without_spare_degrees_of_freedom():
+    # 1 grupo de 2 pontos: 2 observações, 1 nível e 1 inclinação: nenhum grau de liberdade sobra
+    fit = fit_within(np.array([1.0, 2.0]), np.array([1.0, 2.5]), [0, 0])
+
+    assert fit.slope == pytest.approx(1.5) and fit.se is None
+
+
+def test_within_residuals_have_one_entry_per_observation():
+    x, y, g = stints(np.random.default_rng(6))
+
+    assert len(fit_within(x, y, g).residuals) == len(x)
+
+
+def test_within_rejects_inconsistent_lengths():
+    with pytest.raises(ValueError):
+        fit_within(np.array([1.0, 2.0]), np.array([1.0]), [0, 0])

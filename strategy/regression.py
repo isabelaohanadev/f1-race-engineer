@@ -136,6 +136,107 @@ def fit_linear(
     return LinearFit(coef, se, identified, n, n_clusters, rank, weights)
 
 
+@dataclass(frozen=True, slots=True)
+class WithinFit:
+    """Inclinação de y contra x DENTRO de cada grupo (um intercepto por grupo)."""
+
+    slope: float | None  # None: x não varia dentro de nenhum grupo
+    se: float | None  # erro-padrão da inclinação (só amostragem, ver `fit_within`)
+    sigma: (
+        float | None
+    )  # desvio robusto dos resíduos: o ruído de volta, NÃO uma incerteza do parâmetro
+    residuals: np.ndarray  # y - (nível do grupo + inclinação * x), uma por observação
+    n_obs: int
+    n_groups: int  # grupos com pelo menos 2 observações
+    dof: int = 0  # observações - um nível por grupo - a inclinação (0 se não sobra nenhum)
+
+
+def fit_within(
+    x: np.ndarray,
+    y: np.ndarray,
+    groups: Sequence,
+    *,
+    huber_k: float | None = HUBER_K,
+    max_iter: int = 50,
+    tol: float = 1e-9,
+) -> WithinFit:
+    """Regressão com um intercepto por grupo (por stint, no uso do modelo de pneu) e UMA inclinação,
+    robusta a voltas ruins (Huber). Cada stint tem o seu nível de ritmo (piloto, composto, carga de
+    combustível, pista); o que interessa é quanto o tempo muda com a idade DENTRO do stint.
+
+    DUAS INCERTEZAS DIFERENTES saem daqui, e confundi-las é o erro clássico:
+    * `se`: o quanto a inclinação é incerta por ter poucas voltas e ruído (cai com mais dados). Mede
+      só ruído de AMOSTRAGEM, e supõe voltas independentes: com as voltas de um stint
+      correlacionadas (tráfego, ritmo do dia: autocorrelação de ~0,2 medida nos dados) ele sai um
+      pouco pequeno. O modelo não confia só nele.
+    * `sigma`: a dispersão das voltas em torno da reta, o RUÍDO de uma volta. Não cai com mais dados
+      (mais voltas só o medem melhor), e é o que a simulação soma a cada volta futura.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.ndim != 1 or x.shape != y.shape or len(groups) != len(x):
+        raise ValueError("x, y e groups precisam ter o mesmo comprimento")
+    n = len(x)
+    _, codes = np.unique(np.asarray(groups), return_inverse=True)
+    n_codes = int(codes.max()) + 1 if n else 0
+    sizes = np.bincount(codes, minlength=n_codes) if n else np.array([])
+    n_groups = int((sizes >= 2).sum())
+
+    def unidentified(resid: np.ndarray | None = None) -> WithinFit:
+        return WithinFit(None, None, None, np.zeros(n) if resid is None else resid, n, n_groups)
+
+    if n_groups == 0:
+        return unidentified()
+
+    weights = np.ones(n)
+    quadratic = np.ones(n)
+    slope = 0.0
+    resid = np.zeros(n)
+    sxx = 0.0
+    xd = np.zeros(n)
+    for _ in range(max_iter):
+        total_w = np.bincount(codes, weights=weights, minlength=n_codes)
+        mean_x = np.bincount(codes, weights=weights * x, minlength=n_codes) / total_w
+        mean_y = np.bincount(codes, weights=weights * y, minlength=n_codes) / total_w
+        xd, yd = x - mean_x[codes], y - mean_y[codes]
+        sxx = float(np.sum(weights * xd * xd))
+        if sxx < 1e-12:
+            return unidentified()
+        updated = float(np.sum(weights * xd * yd) / sxx)
+        resid = yd - updated * xd
+        moved = abs(updated - slope) >= tol * (1 + abs(slope))
+        slope = updated
+        if huber_k is None:
+            break
+        scale = _MAD_TO_SIGMA * np.median(np.abs(resid - np.median(resid)))
+        if scale < 1e-12:
+            break
+        u = np.abs(resid) / scale
+        quadratic = (u <= huber_k).astype(float)
+        weights = np.where(u <= huber_k, 1.0, huber_k / np.maximum(u, 1e-12))
+        if not moved:
+            break
+
+    in_groups = int(sizes[sizes >= 2].sum())
+    dof = in_groups - n_groups - 1  # observações, menos um nível por grupo, menos a inclinação
+    sigma = float(_MAD_TO_SIGMA * np.median(np.abs(resid - np.median(resid))))
+    se = None
+    if dof > 0:
+        # Sanduíche de heterocedasticidade com a correção de ALAVANCAGEM (HC3): cada resíduo é
+        # dividido por (1 - h), em que h é o quanto aquela volta puxa a própria reta. A versão
+        # simples (HC1) saía pequena demais em stints curtos; medido por simulação, o intervalo de
+        # 95% cobria 75% com 6 voltas, 81% com 8 e 88% com 12. Com HC3 e a t de Student, ~95%.
+        leverage = weights / total_w[codes] + weights * xd * xd / sxx
+        leverage = np.minimum(leverage, 0.999)
+        bread = float(np.sum(quadratic * xd * xd))
+        if bread > 0:
+            meat = float(np.sum((weights * resid * xd / (1 - leverage)) ** 2))
+            se = float(np.sqrt(meat) / bread)
+    return WithinFit(
+        slope, se, sigma if np.isfinite(sigma) else None, resid, n, n_groups, max(dof, 0)
+    )
+
+
 def one_hot(labels: Sequence, *, drop_first: bool = False) -> tuple[np.ndarray, list]:
     """Colunas 0/1, uma por rótulo (em ordem), e a lista dos rótulos. `drop_first` omite o primeiro
     (a categoria de referência), necessário quando o modelo já tem um intercepto implícito."""
