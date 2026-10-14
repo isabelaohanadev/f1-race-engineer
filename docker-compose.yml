@@ -8,7 +8,8 @@ x-postgres-env: &postgres-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-f1_dev_password}
   POSTGRES_DB: ${POSTGRES_DB:-f1_race_engineer}
 
-# Base comum de tudo que roda o código do projeto (app agora; migrate e, na Fase 2, workers).
+# Base comum do que roda o código do projeto E precisa do banco (app e migrate). O worker usa a
+# mesma imagem mas NÃO esta base: ele só fala com o Redis e não recebe a senha do Postgres.
 # A mesma `image:` nos dois serviços faz ambos usarem a MESMA imagem; o segundo build é só
 # cache hit. Banco e Redis são alcançados pelo nome do serviço (db, redis) e pela porta interna.
 x-app-base: &app-base
@@ -133,6 +134,27 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # Worker consumidor da Fase 2: lê o stream da corrida por consumer group e mantém o estado atual
+  # no Redis (replay/state.py). Escala com `docker compose up -d --scale worker=3`: todas as cópias
+  # entram no MESMO grupo e o Redis reparte as entradas entre elas. Seguro por construção: a
+  # atualização é idempotente e à prova de ordem (Lua), e as pendências de uma cópia que morre são
+  # resgatadas pelas outras (XAUTOCLAIM).
+  worker:
+    image: f1-race-engineer:local
+    build: .
+    command: ["python", "-m", "worker"]
+    restart: unless-stopped
+    environment:
+      # Só o Redis: sem credenciais do Postgres (menor privilégio).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # O worker trata SIGTERM terminando o lote em andamento; 15 s é folga de sobra sobre os ~1 s
+    # do BLOCK do XREADGROUP.
+    stop_grace_period: 15s
 
 volumes:
   pgdata:

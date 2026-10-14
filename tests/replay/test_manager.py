@@ -20,7 +20,14 @@ from replay.errors import (
 from replay.lock import lock_key
 from replay.manager import ReplayManager
 from tests.replay.conftest import NOR, VER, at
-from tests.replay.fakes import FakeClock, FakeLock, FakeLockRegistry, FakePublisher, settle
+from tests.replay.fakes import (
+    FakeClock,
+    FakeLock,
+    FakeLockRegistry,
+    FakePublisher,
+    FakeState,
+    settle,
+)
 
 RACE = (2024, 21)
 
@@ -36,13 +43,15 @@ class World:
         self.clock = FakeClock()
         self.registry = registry or FakeLockRegistry()
         self.publisher = FakePublisher(self.clock)
+        self.shared = FakeState()
         self.locks: list[FakeLock] = []
         self.manager = ReplayManager(
             session_factory,
             Mock(),  # o Redis nunca é tocado: lock e publisher são injetados
             clock=self.clock,
             lock_factory=self._new_lock,
-            publisher_factory=lambda stream: self.publisher,
+            publisher_factory=lambda stream, epoch: self.publisher,
+            state=self.shared,
             sleep=fast_sleep,
         )
 
@@ -100,6 +109,17 @@ async def test_start_after_the_previous_replay_finished_starts_a_new_one(world):
     await settle(lambda: world.state() is ReplayState.FINISHED)
 
     assert world.publisher.resets == 2  # cada replay limpa o stream
+
+
+async def test_each_replay_gets_a_new_epoch_and_announces_its_stream(world):
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.FINISHED)
+    await settle(lambda: world.registry.owners == {})
+    assert world.shared.epochs[RACE] == 1 and RACE in world.shared.streams  # os workers o descobrem
+
+    await world.manager.start(*RACE)
+
+    assert world.shared.epochs[RACE] == 2  # outro replay, outro número
 
 
 # ---------------------------------------------------------------- um replay por corrida

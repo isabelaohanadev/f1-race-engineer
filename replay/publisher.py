@@ -46,9 +46,10 @@ class Publisher(Protocol):
 
 
 class StreamPublisher:
-    def __init__(self, redis: Redis, stream: str, maxlen: int = STREAM_MAXLEN) -> None:
+    def __init__(self, redis: Redis, stream: str, epoch: int, maxlen: int = STREAM_MAXLEN) -> None:
         self._redis = redis
         self._stream = stream
+        self._epoch = str(epoch)  # grava em TODA entrada: ver StreamEntry em events.py
         self._maxlen = maxlen
 
     async def reset(self) -> None:
@@ -72,5 +73,6 @@ class StreamPublisher:
             return
         async with self._redis.pipeline(transaction=True) as pipe:
             for event in events:
-                pipe.xadd(self._stream, event.to_fields(), maxlen=self._maxlen, approximate=True)
+                fields = event.to_fields() | {"epoch": self._epoch}
+                pipe.xadd(self._stream, fields, maxlen=self._maxlen, approximate=True)
             await pipe.execute()

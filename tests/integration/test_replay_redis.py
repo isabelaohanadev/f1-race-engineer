@@ -29,7 +29,7 @@ async def test_published_events_are_readable_by_a_consumer_and_parse_back(redis_
         LapCompletedEvent("ALB", 1, 1_600),  # campos nulos omitidos
     ]
 
-    await StreamPublisher(redis_client, STREAM).publish_many(events)
+    await StreamPublisher(redis_client, STREAM, epoch=1).publish_many(events)
 
     entries = await redis_client.xrange(STREAM)
     assert [parse_event(fields) for _, fields in entries] == events  # mesma ordem, nada perdido
@@ -38,7 +38,7 @@ async def test_published_events_are_readable_by_a_consumer_and_parse_back(redis_
 
 
 async def test_maxlen_keeps_the_stream_bounded_and_drops_only_the_oldest(redis_client: Redis):
-    publisher = StreamPublisher(redis_client, STREAM, maxlen=100)
+    publisher = StreamPublisher(redis_client, STREAM, epoch=1, maxlen=100)
     events = [PositionEvent("VER", i, i, i) for i in range(2000)]
 
     for start in range(0, len(events), 200):
@@ -57,7 +57,7 @@ async def test_maxlen_keeps_the_stream_bounded_and_drops_only_the_oldest(redis_c
 async def test_a_hundred_thousand_entries_use_a_few_megabytes(redis_client: Redis):
     """Guarda do formato: base do argumento de que STREAM_MAXLEN (100 mil) não é limitado pela
     memória (medido: 4,2 MB). Se alguém trocar os campos planos por blobs maiores, quebra aqui."""
-    publisher = StreamPublisher(redis_client, STREAM, maxlen=STREAM_MAXLEN)
+    publisher = StreamPublisher(redis_client, STREAM, epoch=1, maxlen=STREAM_MAXLEN)
     events = [PositionEvent("VER", i % 9000, -(i % 9000), i) for i in range(STREAM_MAXLEN)]
 
     for start in range(0, len(events), 500):
@@ -68,7 +68,7 @@ async def test_a_hundred_thousand_entries_use_a_few_megabytes(redis_client: Redi
 
 
 async def test_reset_deletes_the_stream_together_with_its_consumer_groups(redis_client: Redis):
-    publisher = StreamPublisher(redis_client, STREAM)
+    publisher = StreamPublisher(redis_client, STREAM, epoch=1)
     await publisher.publish_many([PositionEvent("VER", 1, 1, 1)])
     await redis_client.xgroup_create(STREAM, "workers", id="0")
 

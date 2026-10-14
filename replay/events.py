@@ -151,3 +151,54 @@ def parse_event(fields: Mapping[str, str]) -> ReplayEvent:
     except (KeyError, ValueError) as exc:
         raise MalformedEvent(f"evento inválido {dict(fields)!r}: {exc!r}") from exc
     raise MalformedEvent(f"tipo de evento desconhecido: {fields.get('type')!r}")
+
+
+# ---------------------------------------------------------------- entrada do stream (com epoch)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamEntry:
+    """Uma entrada lida do stream: o evento + de que REPLAY ele veio (`epoch`) + o ID do Redis.
+
+    `epoch` é um número que só cresce, um por replay (INCR em replay:epoch:{y}:{r}). O publisher o
+    grava em TODA entrada. É o que impede um evento atrasado de um replay antigo de sobrescrever o
+    estado do replay novo (ver replay/state.py).
+    """
+
+    id: str
+    epoch: int
+    event: ReplayEvent
+
+
+def parse_entry(entry_id: str, fields: Mapping[str, str]) -> StreamEntry:
+    try:
+        epoch = int(fields["epoch"])
+    except (KeyError, ValueError) as exc:
+        raise MalformedEvent(f"entrada {entry_id} sem epoch válido: {dict(fields)!r}") from exc
+    return StreamEntry(id=entry_id, epoch=epoch, event=parse_event(fields))
+
+
+_MAX_SEQ = 2**64 - 1
+
+
+def id_tuple(entry_id: str) -> tuple[int, int]:
+    """'1730649000123-5' -> (1730649000123, 5), comparável (a ordem de um ID Redis é a da tupla)."""
+    ms, _, seq = entry_id.partition("-")
+    return int(ms), int(seq or 0)
+
+
+def id_ms(entry_id: str) -> int:
+    """Instante (ms Unix) em que o Redis registrou a entrada: é a parte de tempo do ID. Serve para
+    medir a latência entre publicar e entregar sem gravar relógio nenhum no evento."""
+    return id_tuple(entry_id)[0]
+
+
+def id_before(entry_id: str) -> str:
+    """O ID imediatamente ANTERIOR. Como XREAD/XRANGE são exclusivos no início ('depois de X'), ler
+    a partir de `id_before(X)` devolve a própria entrada X."""
+    ms, seq = id_tuple(entry_id)
+    if seq > 0:
+        return f"{ms}-{seq - 1}"
+    if ms > 0:
+        return f"{ms - 1}-{_MAX_SEQ}"
+    return "0-0"

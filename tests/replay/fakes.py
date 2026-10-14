@@ -84,6 +84,22 @@ class ListSource:
             self.closed = True
 
 
+class FakeState:
+    """O estado compartilhado em memória: só numera replays e anota os streams anunciados."""
+
+    def __init__(self) -> None:
+        self.epochs: dict[tuple[int, int], int] = {}
+        self.streams: set[tuple[int, int]] = set()
+
+    async def new_epoch(self, year: int, round_number: int) -> int:
+        key = (year, round_number)
+        self.epochs[key] = self.epochs.get(key, 0) + 1
+        return self.epochs[key]
+
+    async def register_stream(self, year: int, round_number: int) -> None:
+        self.streams.add((year, round_number))
+
+
 class FakeLockRegistry:
     """O "Redis" dos locks: compartilhe UMA instância entre dois gerenciadores para simular dois
     processos disputando a mesma corrida."""

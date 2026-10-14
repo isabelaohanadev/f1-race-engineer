@@ -30,12 +30,20 @@ from replay.events import stream_key
 from replay.lock import DEFAULT_TTL_MS, ReplayLock, lock_key
 from replay.publisher import STREAM_MAXLEN, Publisher, StreamPublisher
 from replay.source import DEFAULT_PAGE_SIZE, RaceSource
+from replay.state import RaceStateStore
 
 logger = logging.getLogger(__name__)
 
 ALLOWED_SPEEDS = (1.0, 4.0, 16.0)
 
 RaceKey = tuple[int, int]  # (year, round)
+
+
+class StateRegistry(Protocol):
+    """O que o gerenciador precisa do estado compartilhado: numerar o replay e anunciar o stream."""
+
+    async def new_epoch(self, year: int, round_number: int) -> int: ...
+    async def register_stream(self, year: int, round_number: int) -> None: ...
 
 
 class Lock(Protocol):
@@ -64,7 +72,8 @@ class ReplayManager:
         maxlen: int = STREAM_MAXLEN,
         lock_ttl_ms: int = DEFAULT_TTL_MS,
         lock_factory: Callable[[int, int], Lock] | None = None,
-        publisher_factory: Callable[[str], Publisher] | None = None,
+        publisher_factory: Callable[[str, int], Publisher] | None = None,
+        state: StateRegistry | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._session_factory = session_factory
@@ -75,8 +84,9 @@ class ReplayManager:
             lambda year, rnd: ReplayLock(redis, lock_key(year, rnd), lock_ttl_ms)
         )
         self._publisher_factory = publisher_factory or (
-            lambda stream: StreamPublisher(redis, stream, maxlen)
+            lambda stream, epoch: StreamPublisher(redis, stream, epoch, maxlen)
         )
+        self._state: StateRegistry = state or RaceStateStore(redis)
         self._runs: dict[RaceKey, _Run] = {}  # o último replay de cada corrida (ativo ou não)
         self._starting: set[RaceKey] = set()  # reservas de start() ainda em andamento
 
@@ -125,7 +135,11 @@ class ReplayManager:
                 source = await RaceSource.open(
                     self._session_factory, year, round_number, page_size=self._page_size
                 )
-                publisher = self._publisher_factory(stream_key(year, round_number))
+                # Um número por replay, que viaja em toda entrada do stream: é o que isola o estado
+                # deste replay do de qualquer replay anterior (ver replay/state.py).
+                epoch = await self._state.new_epoch(year, round_number)
+                publisher = self._publisher_factory(stream_key(year, round_number), epoch)
+                await self._state.register_stream(year, round_number)  # os workers o descobrem
                 await publisher.reset()
                 engine = ReplayEngine(source, publisher, clock=self._clock, speed=speed)
             except BaseException:  # inclui cancelamento (cliente desconectou no meio do start)
