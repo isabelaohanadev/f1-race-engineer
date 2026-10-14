@@ -15,3 +15,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 testpaths = ["tests"]
 # Permite `import app`, `import ingestion`... a partir da raiz sem instalar o projeto.
 pythonpath = ["."]
+# --strict-markers: um marker digitado errado (ex.: "integraton") vira erro, em vez de um teste
+# que silenciosamente deixa de ser filtrado.
+addopts = "--strict-markers"
+markers = [
+    "integration: usa o TimescaleDB real do Compose (docker compose up -d db). Pule com -m 'not integration'",
+]
