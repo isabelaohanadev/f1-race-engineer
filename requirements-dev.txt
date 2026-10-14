@@ -1,0 +1,5 @@
+# Ferramentas de desenvolvimento e CI (não vão para a imagem de produção).
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27  # exigido pelo TestClient do FastAPI
+ruff>=0.6

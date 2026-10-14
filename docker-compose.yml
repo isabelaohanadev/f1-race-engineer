@@ -1,0 +1,63 @@
+name: f1-race-engineer
+
+# Credenciais compartilhadas entre db e app, definidas uma única vez (âncora YAML).
+# O Compose lê o .env da raiz automaticamente para resolver ${VAR}; o ":-" dá um default
+# de dev, então `docker compose up --build` funciona mesmo sem criar o .env.
+x-postgres-env: &postgres-env
+  POSTGRES_USER: ${POSTGRES_USER:-f1}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-f1_dev_password}
+  POSTGRES_DB: ${POSTGRES_DB:-f1_race_engineer}
+
+services:
+  db:
+    # Imagem oficial do Postgres 16 com a extensão TimescaleDB já instalada. Usamos Timescale
+    # porque a telemetria de posição é uma série temporal enorme (milhões de linhas por
+    # corrida): hypertables particionam por tempo e dão compressão e consultas por janela rápidas.
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment: *postgres-env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Volume nomeado: os dados sobrevivem a `docker compose down` (só `down -v` apaga).
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # "$$" evita que o Compose interpole; quem expande a variável é o shell do container.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+      # Dentro da rede do compose o banco é alcançado pelo nome do serviço, na porta interna.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      FASTF1_CACHE_DIR: /cache/fastf1
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      # Cache do FastF1 persistente: reingerir uma corrida não baixa tudo de novo da API.
+      - fastf1_cache:/cache/fastf1
+    depends_on:
+      db:
+        # Só sobe o app quando o Postgres está aceitando conexões (não apenas "container iniciado").
+        condition: service_healthy
+    healthcheck:
+      # A imagem slim não tem curl; usamos o próprio Python.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pgdata:
+  fastf1_cache:

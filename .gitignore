@@ -1,0 +1,39 @@
+# ---------- Segredos / ambiente ----------
+# O .env tem credenciais reais: NUNCA versionar. O .env.example (sem segredos) é versionado.
+.env
+.env.*
+!.env.example
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ---------- Ferramentas (cache e relatórios) ----------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ---------- FastF1 ----------
+# Cache HTTP do FastF1: centenas de MB por sessão e totalmente regenerável.
+.fastf1-cache/
+fastf1_cache/
+cache/
+
+# ---------- Docker ----------
+# Overrides locais do compose (portas, bind mounts) ficam fora do repo.
+docker-compose.override.yml
+# Caso alguém troque o volume nomeado por bind mount em ./pgdata
+pgdata/
+
+# ---------- Editor / SO ----------
+.idea/
+.vscode/
+.DS_Store

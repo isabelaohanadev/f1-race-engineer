@@ -1,0 +1,10 @@
+# Dependências de runtime. Faixas compatíveis (>= mínimo testado, < próxima major) em vez de
+# pins exatos: o CI detecta quebras sem travarmos em versões antigas.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic-settings>=2.4,<3.0
+sqlalchemy>=2.0.30,<2.1
+alembic>=1.13,<2.0
+# psycopg 3 (driver moderno); [binary] traz a libpq embutida e dispensa libpq-dev na imagem slim.
+psycopg[binary]>=3.2,<4.0
+fastf1>=3.4,<4.0

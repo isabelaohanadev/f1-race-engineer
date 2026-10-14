@@ -1,0 +1,17 @@
+# Aqui ficam só as configurações das ferramentas. As dependências ficam em requirements*.txt
+# porque o projeto é uma aplicação (não uma biblioteca instalável) e isso rende melhor cache
+# de camadas no Docker.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/F: erros básicos e pyflakes | I: ordenação de imports | UP: sintaxe moderna do Python
+# B: bugs comuns (flake8-bugbear) | SIM: simplificações
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Permite `import app`, `import ingestion`... a partir da raiz sem instalar o projeto.
+pythonpath = ["."]
