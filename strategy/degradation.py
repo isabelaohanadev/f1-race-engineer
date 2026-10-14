@@ -283,7 +283,14 @@ def fit_degradation(
     que se sabia na volta."""
     visible = laps_until(rows, upto_lap)  # PRIMEIRO passo: nada do futuro passa daqui
     laps = dry_clean_laps(visible)
-    fuel = fuel_coefficient(visible, upto_lap=upto_lap, total_laps=total_laps, variant=variant)
+    # Com o `k` forçado não há o que estimar: a variante física evita refazer o jackknife (~20
+    # ajustes) só para jogar o resultado fora.
+    fuel = fuel_coefficient(
+        visible,
+        upto_lap=upto_lap,
+        total_laps=total_laps,
+        variant=variant if kappa is None else FuelVariant.FISICO,
+    )
     if kappa is not None:
         fuel = replace(fuel, kappa=kappa)
     units, residuals = _units(laps, fuel.kappa)

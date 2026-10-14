@@ -603,6 +603,7 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Perda no pit medida na própria corrida, só em bandeira verde** | `perda = (volta de entrada + de saída) - 2 x ritmo normal`, com o ritmo normal a média da mediana das voltas limpas antes e depois (a janela simétrica cancela a tendência do combustível: a perda sai a mesma com o `k` certo ou errado, testado). Paradas sob SC/VSC/vermelha ficam fora da estimativa. Devolve a mediana e a dispersão **entre paradas** (o `sd` que importa na margem: atacante e rival pagam paradas independentes e o erro da mediana é o mesmo para os dois). Com poucas paradas encolhe para o prior. |
 | **Constantes que saem dos dados, calculadas sem a corrida avaliada** | `TAU_FALLBACK`, o piso entre compostos e a reserva da perda no pit viram um `Priors`, recalculado por `leave_one_out` deixando a corrida de fora (testado: trocar os números dela por absurdos não muda a constante dela). `earlier_only=True` usa só corridas anteriores no calendário, o que se saberia ao vivo. O padrão (`DEFAULT_PRIORS`) tem as 21 corridas dentro e **não serve a backtest**. |
 | **Nível de ritmo por stint, e a diferença entre compostos medida DENTRO do piloto** | A degradação só tem inclinações; para comparar pneu novo com gasto falta o nível. O nível é o tempo corrigido na idade zero, por stint, encolhido para a média do composto (com a variância do próprio stint moderada: um stint de 4 voltas ruidosas não manda sozinho). O nível de um piloto num composto que ele ainda não usou NÃO é a média desse composto (mistura pilotos rápidos e lentos, e no teste errava mais de 0,8 s): é o nível dele no composto atual mais a diferença entre os dois compostos, medida nos pilotos que rodaram os dois, onde o ritmo de cada um se cancela. Entre atacante e rival conta a **diferença**, e a evolução da pista aparece nos dois e se cancela (testado: com `k` de 0,05 ou 0,12 a diferença prevista entre dois carros muda menos de 0,08 s, e o tempo absoluto muda mais de 0,2 s). |
+| **Undercut: margem num horizonte de K voltas, com o ponto de retorno e o tráfego, e confiança por propagação linear exata** | Atacante e rival são comparados no mesmo horizonte (a perda média cancela: só a dispersão entre as duas paradas fica). Pelos relógios (`session_time_ms`) se vê atrás de quem o atacante volta e se ele passa: voltar no meio de um carro mais lento faz o ganho sumir. A confiança é `P(margem > 0)`; o desvio propaga as incertezas **linearmente**, porque o erro da inclinação mexe nas voltas velhas e (pela extrapolação à idade zero) nas novas, com sinal oposto, e a diferença de composto é um erro compartilhado quando os dois trocam o mesmo par. Alerta com limiar 0,6 e histerese (desliga abaixo de 0,5); não alerta sob SC/VSC/vermelha/amarela, com o rival já parado, com origem "todos os compostos" nem com poucas voltas para recuperar a perda. Detalhes e o que não foi validado: `docs/undercut.md`. |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
 | **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
 | **Backtest principal só com corridas secas; as demais à parte** | Em pista molhada, ou que seca durante a corrida, o tempo cai por causa da pista e o modelo "descobre" degradação negativa: medir o erro nelas mediria o clima. O principal usa as 21 corridas com 99% ou mais das voltas em pneu de seco. A **corrida britânica** (76% seca, pista secando) é a que mais tentaria entrar por engano e fica à parte, junto com o Canadá e o Brasil (molhadas). |
@@ -721,6 +722,32 @@ Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
   é o gargalo, o caminho é um modelo de ritmo com efeito fixo de volta (não depende do `k`), que não
   fiz.
 
+#### O alerta de undercut: o que fiz, o que testei, o que NÃO validei
+
+- **O que o código calcula** (`strategy/undercut.py`, detalhe em `docs/undercut.md`): para cada par
+  atacante/rival, a margem em segundos se o atacante parar agora e o rival parar daqui a `K` voltas, a
+  probabilidade de ela ser positiva, e os motivos de não alertar. Só usa voltas até a volta N.
+- **Um erro meu que um teste pegou:** a primeira versão do tráfego só olhava o carro mais próximo à
+  frente do atacante. Quando o rival parava e virava esse carro, a volta lenta dele o fazia "passável" e
+  o carro de trás, que de fato segurava o atacante, era ignorado (margem −0,70 s contra −1,25 s). Agora
+  o atacante não termina uma volta à frente de **nenhum** carro que não consegue passar.
+- **Como testei:** margem calculada à mão num mundo plano (8,4 s para N=30, K=5, 5 s de gap; o código dá
+  8,3999995); margem prevista contra a **realizada** num mundo contrafactual em que o undercut acontece
+  no gerador; a álgebra da incerteza contra uma simulação dos mesmos parâmetros (2%); teste de
+  corrupção do futuro com contraprova; 19 mutações, todas derrubam um teste (uma sobreviveu na primeira
+  rodada e reforçou um teste).
+- **O que NÃO validei:** **nada contra a realidade**. Tudo é dado sintético, onde o desvio previsto ficou
+  bem acima do erro (|z| < 0,35) porque o mundo sintético não tem espalhamento entre corridas; nos dados
+  reais o desvio inclui 0,46 s por volta líquida de espalhamento entre corridas na diferença de composto,
+  e se isso é demais ou de menos só o backtest diz. O módulo rodou em dado real numa corrida (Miami,
+  voltas 20, 28 e 40), o que mostra que não quebra, não que acerta. O fator de inflação (1,3) é
+  provisório e vem da calibração da inclinação, não da margem; a regra de ultrapassagem (0,7 s/volta de
+  vantagem, 0,7 s de distância) é uma heurística; os outros carros não param no horizonte; o composto
+  seguinte é o mais provável, não o escolhido.
+- **Viés da avaliação que vem a seguir:** só se observam as paradas que aconteceram, e as equipes
+  tendem a parar quando funciona. Medir precisão e calibração só nelas é otimista e não mede
+  revocação. Será dito junto com o número.
+
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
 
@@ -792,6 +819,11 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 
 **Estratégia (Fase 3, até aqui):**
 
+- **O alerta de undercut ainda não foi medido contra paradas reais.** Está validado só com dados
+  sintéticos de resposta conhecida e uma execução em uma corrida real. Os limiares (0,6 liga, 0,5
+  desliga), o fator de inflação do desvio (1,3), a regra de ultrapassagem e o horizonte `K` são
+  configurações **não calibradas em dado real**; a avaliação (etapa 8) as ajusta e dirá se o alerta
+  acerta, com o viés de só observar as paradas que aconteceram (`docs/undercut.md`).
 - **Degradação negativa no Catar, sem causa conhecida.** Mesmo com o `k` escolhido, HARD e MEDIUM
   saem com degradação negativa no GP do Catar (HARD -0,023 e MEDIUM -0,029 s por volta de idade com
   o `k` físico). Descartei uma hipótese (voltas de safety car inflando a idade do pneu, ver acima) e
@@ -862,7 +894,8 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo
+strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo,
+                undercut
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

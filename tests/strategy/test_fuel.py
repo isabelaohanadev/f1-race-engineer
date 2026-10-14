@@ -20,6 +20,7 @@ from strategy.fuel import (
     FuelEstimate,
     FuelVariant,
     choose_fuel_coefficient,
+    coefficient_sd,
     coefficient_series,
     compound_slopes,
     correct_for_fuel,
@@ -495,6 +496,50 @@ def test_the_shrinkage_variant_starts_physical_and_ends_at_the_estimate():
 
     assert (early.kappa, early.weight) == (PHYS_SYN, 0.0)
     assert late.weight > 0.95 and late.kappa == pytest.approx(1.6 * PHYS_SYN, rel=0.05)
+
+
+def test_the_effective_standard_error_of_each_variant_is_reported():
+    """O erro-padrão efetivo acompanha o `k` usado: sem estimativa (físico) não há; o estimado traz
+    o
+    dele; o encolhimento traz o MAIOR entre o do ajuste e o do jackknife (o que ele usou)."""
+    race = synthetic_race(kappa=1.6 * PHYS_SYN, seed=5)
+
+    def get(variant):
+        return fuel_coefficient(race, upto_lap=45, total_laps=TOTAL_LAPS, variant=variant)
+
+    physical, estimated, shrunk = (get(v) for v in FuelVariant)
+
+    assert physical.se is None
+    assert estimated.se == pytest.approx(estimated.estimate.se)
+    assert shrunk.se >= shrunk.estimate.se
+
+
+def test_the_k_uncertainty_mixes_the_prior_of_the_constant_and_the_estimate_by_the_weight():
+    """Peso 0: só a incerteza a priori da constante física (50% dela). Peso 1: o erro-padrão do
+    estimado. No meio, as duas em quadratura, ponderadas. Sem erro-padrão, vale a do prior."""
+    race = synthetic_race(kappa=1.6 * PHYS_SYN, seed=5)
+    base = fuel_coefficient(race, upto_lap=45, total_laps=TOTAL_LAPS, variant=FuelVariant.ESTIMADO)
+    prior_sd = PRIOR_REL_SD * base.physical
+
+    assert coefficient_sd(replace(base, weight=0.0)) == pytest.approx(prior_sd)
+    assert coefficient_sd(replace(base, weight=1.0, se=0.004)) == pytest.approx(0.004)
+    assert coefficient_sd(replace(base, weight=0.5, se=0.004)) == pytest.approx(
+        0.5 * np.hypot(prior_sd, 0.004)
+    )
+    assert coefficient_sd(replace(base, weight=1.0, se=None)) == pytest.approx(prior_sd)
+
+
+def test_the_k_uncertainty_falls_as_the_race_gives_the_estimate_more_weight():
+    race = synthetic_race(kappa=1.6 * PHYS_SYN, seed=5)
+
+    def sd_at(n):
+        c = fuel_coefficient(
+            race, upto_lap=n, total_laps=TOTAL_LAPS, variant=FuelVariant.ENCOLHIMENTO
+        )
+        return coefficient_sd(c)
+
+    assert sd_at(9) == pytest.approx(PRIOR_REL_SD * PHYS_SYN)  # cedo: só o prior
+    assert sd_at(TOTAL_LAPS) < 0.5 * sd_at(9)  # no fim, a corrida sabe mais que a constante
 
 
 @pytest.mark.parametrize("variant", list(FuelVariant))

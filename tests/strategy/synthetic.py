@@ -112,3 +112,43 @@ def build_race(plans: list[Plan], world: World | None = None) -> list[LapRow]:
         )  # fmt: skip
         for r in rows
     ]
+
+
+def chase_field(
+    *,
+    a_stop: int = 45,
+    r_stop: int = 45,
+    gap: float = 5.0,
+    world: World | None = None,
+    extra: tuple[Plan, ...] = (),
+    slow_cars: int = 12,
+) -> list[LapRow]:
+    """O cenário do undercut: o rival `R` e o atacante `A`, igualmente rápidos (base 88 s) e ambos
+    no primeiro stint de MEDIUM, com `A` a `gap` s atrás de `R`. Mais `slow_cars` carros lentos
+    (base 92+), longe deles, que já pararam (MEDIUM ou SOFT para HARD nas voltas 12 a 23): dão ao
+    modelo paradas para medir a perda e pares de compostos para medir a diferença entre eles.
+
+    Os carros só interagem pelo relógio (não há tráfego no gerador), então a margem REALIZADA de um
+    undercut é a diferença dos relógios no mundo contrafactual `chase_field(a_stop=N+1,
+    r_stop=N+K)`, que tem a mesma história até a volta N."""
+    world = world or World()
+    plans = [
+        Plan(
+            f"D{i:02d}",
+            base=92 + 0.3 * i,
+            compound="MEDIUM" if i % 2 else "SOFT",
+            stops=((12 + i, "HARD"),),
+            grid_gap=3.0 * i,
+        )
+        for i in range(slow_cars)
+    ]
+    plans.append(Plan("R", base=88.0, stops=((r_stop, "HARD"),)))
+    plans.append(Plan("A", base=88.0, stops=((a_stop, "HARD"),), grid_gap=gap))
+    return build_race([*plans, *extra], world)
+
+
+def clock_at(rows: list[LapRow], driver: str, lap: int) -> float:
+    """O relógio da sessão (s) ao fim da volta, no gerador."""
+    return (
+        next(r.session_time_ms for r in rows if r.driver == driver and r.lap_number == lap) / 1000
+    )

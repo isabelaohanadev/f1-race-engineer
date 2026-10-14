@@ -406,6 +406,36 @@ def test_the_degradation_shifts_by_exactly_the_change_in_k_and_the_uncertainties
     assert shrunk.sigma_lap == pytest.approx(physical.sigma_lap, rel=1e-6)
 
 
+def test_a_forced_k_is_used_as_given_and_skips_the_estimate_of_k(race):
+    """`kappa=` força o `k` (o undercut o desloca em +- sd para medir a dependência): o modelo usa
+    exatamente esse valor, e o resultado é o mesmo qualquer que seja a variante pedida, porque não
+    há nada a estimar (e o jackknife, ~20 ajustes, não é refeito)."""
+    forced = {
+        v: fit_degradation(race, upto_lap=TOTAL, total_laps=TOTAL, variant=v, kappa=0.07)
+        for v in FuelVariant
+    }
+
+    assert {m.fuel.kappa for m in forced.values()} == {0.07}
+    assert forced[FuelVariant.FISICO] == forced[FuelVariant.ENCOLHIMENTO]
+    assert forced[FuelVariant.FISICO] == forced[FuelVariant.ESTIMADO]
+    assert forced[FuelVariant.ENCOLHIMENTO].fuel.se is None  # sem jackknife
+
+
+def test_forcing_k_to_its_own_value_changes_nothing_but_the_bookkeeping(race, model):
+    """Forçar o `k` que o próprio modelo escolheu devolve as mesmas inclinações e incertezas."""
+    again = fit_degradation(
+        race,
+        upto_lap=TOTAL,
+        total_laps=TOTAL,
+        variant=FuelVariant.ENCOLHIMENTO,
+        kappa=model.fuel.kappa,
+    )
+
+    assert again.compounds == model.compounds
+    assert again.units == model.units
+    assert (again.tau, again.sigma_lap) == (model.tau, model.sigma_lap)
+
+
 # ------------------------------------------------------------------ stints futuros
 
 

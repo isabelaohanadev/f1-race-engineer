@@ -311,6 +311,7 @@ class FuelCoefficient:
     estimate: FuelEstimate
     weight: float  # peso do estimado: 0 = só o físico, 1 = só o estimado (limitado)
     reason: str
+    se: float | None = None  # o erro-padrão efetivo do estimado (None se não há estimativa)
 
 
 def fuel_coefficient(
@@ -331,7 +332,9 @@ def fuel_coefficient(
     if variant is FuelVariant.ESTIMADO:
         choice = choose_fuel_coefficient(estimate, physical)
         weight = 1.0 if choice.source == "estimado" else 0.0
-        return FuelCoefficient(choice.kappa, variant, physical, estimate, weight, choice.reason)
+        return FuelCoefficient(
+            choice.kappa, variant, physical, estimate, weight, choice.reason, estimate.se
+        )
 
     if not estimate.identified:
         return FuelCoefficient(physical, variant, physical, estimate, 0.0, estimate.note)
@@ -345,7 +348,19 @@ def fuel_coefficient(
         estimate.kappa, max(estimate.se, jackknife), physical, data=data
     )
     reason = f"peso do estimado {weight:.2f} (dados {data:.2f})"
-    return FuelCoefficient(kappa, variant, physical, estimate, weight, reason)
+    return FuelCoefficient(
+        kappa, variant, physical, estimate, weight, reason, max(estimate.se, jackknife)
+    )
+
+
+def coefficient_sd(coefficient: FuelCoefficient) -> float:
+    """O quanto o `k` usado pode estar errado, em s por volta: mistura a incerteza do físico (a
+    priori, 50% dele) e a do estimado, ponderadas pelo peso. Sem estimativa (peso 0) é a do físico;
+    com o estimado dominando, é o erro-padrão dele. É aproximada (a média de duas fontes
+    independentes), e é o que o undercut usa para medir o quanto o resultado depende do `k`."""
+    prior_sd = PRIOR_REL_SD * coefficient.physical
+    se = coefficient.se if coefficient.se is not None else prior_sd
+    return float(np.hypot((1 - coefficient.weight) * prior_sd, coefficient.weight * se))
 
 
 def coefficient_series(
