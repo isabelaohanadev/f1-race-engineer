@@ -9,7 +9,9 @@ from db.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: por padrão o fileConfig DESLIGA todos os loggers já criados
+    # (inclusive os do app e do pytest) quando a migration roda dentro de outro processo Python.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Metadata dos models: base do `alembic revision --autogenerate` e do `alembic check`.
 target_metadata = Base.metadata

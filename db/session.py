@@ -16,9 +16,15 @@ from app.config import get_settings
 
 @lru_cache
 def get_engine() -> Engine:
-    # pool_pre_ping: testa a conexão antes de usá-la, então um restart do Postgres não deixa
-    # conexões "mortas" no pool causando um erro no primeiro request seguinte.
-    return create_engine(get_settings().database_url, pool_pre_ping=True)
+    return create_engine(
+        get_settings().database_url,
+        # pool_pre_ping: testa a conexão antes de usá-la, então um restart do Postgres não deixa
+        # conexões "mortas" no pool causando um erro no primeiro request seguinte.
+        pool_pre_ping=True,
+        # Sem timeout, o libpq espera INDEFINIDAMENTE por um host que não responde (rede caída,
+        # firewall descartando pacotes). Com 3s o /health responde 503 em vez de pendurar.
+        connect_args={"connect_timeout": 3},
+    )
 
 
 @lru_cache

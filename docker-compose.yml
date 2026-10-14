@@ -74,7 +74,9 @@ services:
         # ...e depois que o schema foi criado/atualizado com sucesso.
         condition: service_completed_successfully
     healthcheck:
-      # A imagem slim não tem curl; usamos o próprio Python.
+      # A imagem slim não tem curl; usamos o próprio Python. O /health devolve 503 quando o banco
+      # cai, e o urlopen levanta exceção em 4xx/5xx: o container fica "unhealthy" no
+      # `docker compose ps` (sem ser reiniciado: o restart policy não olha para o healthcheck).
       test:
         - CMD
         - python
