@@ -53,6 +53,9 @@ class RaceRef:
     total_laps: int
     kind: RaceKind
     dry_share: float
+    year: int = 0
+    round: int = 0
+    circuit: str | None = None  # `Race.location`: o mesmo circuito em temporadas diferentes
 
     @property
     def is_main(self) -> bool:
@@ -79,6 +82,9 @@ def split_population(session, year: int | None = None) -> tuple[list[RaceRef], l
             total,
             classify_race(rows),
             dry_race_share(rows),
+            race.year,
+            race.round,
+            race.location,
         )
         (main if ref.is_main else separate).append(ref)
     return main, separate

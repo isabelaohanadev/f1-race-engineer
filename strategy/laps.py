@@ -76,8 +76,9 @@ def load_race_laps(session: Session, race_id: int) -> list[LapRow]:
 
 
 def list_races(session: Session, year: int | None = None) -> Sequence:
-    """(id, year, round, name, total_laps) das corridas, em ordem de calendário."""
-    stmt = select(Race.id, Race.year, Race.round, Race.name, Race.total_laps)
+    """(id, year, round, name, total_laps, location) das corridas, em ordem de calendário.
+    `location` ("Sakhir", "Monte Carlo"...) é o que identifica o CIRCUITO entre temporadas."""
+    stmt = select(Race.id, Race.year, Race.round, Race.name, Race.total_laps, Race.location)
     if year is not None:
         stmt = stmt.where(Race.year == year)
     return session.execute(stmt.order_by(Race.year, Race.round)).all()

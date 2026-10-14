@@ -334,6 +334,13 @@ E o modelo de degradação, com a calibração e as corridas à parte, em `docs/
 python -m strategy.degradation --markdown docs/degradacao.md
 ```
 
+E a perda no pit e as constantes por corrida, com a reserva calculada sem cada corrida, em
+`docs/perda-no-pit.md`:
+
+```bash
+python -m strategy.race_stats --markdown docs/perda-no-pit.md
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -593,6 +600,8 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. **Não foi apertado** depois: virou a variante `estimado` do backtest. |
 | **`k` com encolhimento contínuo, e as três variantes comparadas no backtest** | `k = w * estimado + (1 - w) * físico`, em vez de trocar de fonte num ponto da corrida (um degrau em `k` passa 1 para 1 para a degradação). `w = paradas_vistas/pilotos (no máximo 1) * precisão`; o estimado entra limitado a 0,5x..2x do físico e o erro-padrão é o maior entre o por cluster e o do jackknife por piloto. Só usa voltas até a volta N (testado corrompendo o futuro). `fisico`, `estimado` e `encolhimento` são variantes do backtest da etapa 8, e os números decidem o padrão. |
 | **Degradação por composto e por piloto, com encolhimento e três incertezas separadas** | Um piloto com 8 voltas num composto tem uma inclinação de erro enorme; a média do composto na corrida (de ~20 pilotos) é estável, mas não é "dele". O encolhimento normal-normal pesa as duas pela precisão (`B = t²/(t²+se²)`): com pouco dado vale o composto, com muito vale o piloto. As incertezas saem separadas: `se` (do parâmetro, cai com dados), `σ` (ruído de UMA volta, não cai) e `τ` (variação real da inclinação entre pilotos/stints, estimada pelos próprios dados). Para prever um stint **futuro** vale `sqrt(se² + τ²)`; só com `se` o alerta de undercut ficaria confiante demais. |
+| **Perda no pit medida na própria corrida, só em bandeira verde** | `perda = (volta de entrada + de saída) - 2 x ritmo normal`, com o ritmo normal a média da mediana das voltas limpas antes e depois (a janela simétrica cancela a tendência do combustível: a perda sai a mesma com o `k` certo ou errado, testado). Paradas sob SC/VSC/vermelha ficam fora da estimativa. Devolve a mediana e a dispersão **entre paradas** (o `sd` que importa na margem: atacante e rival pagam paradas independentes e o erro da mediana é o mesmo para os dois). Com poucas paradas encolhe para o prior. |
+| **Constantes que saem dos dados, calculadas sem a corrida avaliada** | `TAU_FALLBACK`, o piso entre compostos e a reserva da perda no pit viram um `Priors`, recalculado por `leave_one_out` deixando a corrida de fora (testado: trocar os números dela por absurdos não muda a constante dela). `earlier_only=True` usa só corridas anteriores no calendário, o que se saberia ao vivo. O padrão (`DEFAULT_PRIORS`) tem as 21 corridas dentro e **não serve a backtest**. |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
 | **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
 | **Backtest principal só com corridas secas; as demais à parte** | Em pista molhada, ou que seca durante a corrida, o tempo cai por causa da pista e o modelo "descobre" degradação negativa: medir o erro nelas mediria o clima. O principal usa as 21 corridas com 99% ou mais das voltas em pneu de seco. A **corrida britânica** (76% seca, pista secando) é a que mais tentaria entrar por engano e fica à parte, junto com o Canadá e o Brasil (molhadas). |
@@ -669,6 +678,28 @@ Nas 21 corridas secas (`docs/degradacao.md`), ajustado com a corrida inteira:
 - **Duas constantes saem destes dados**: `TAU_FALLBACK` (0,022, a mediana de τ, usada quando a corrida
   ainda não tem dados para estimá-lo) e `BETWEEN_COMPOUNDS_FLOOR` (0,017, a mediana do desvio entre as
   médias dos compostos). Um backtest estrito deveria recalculá-las sem a corrida testada.
+
+
+#### A perda no pit: o que medi
+
+Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
+
+- **Mediana por corrida: 22,5 s**, de 18,8 s (Bélgica) a 29,8 s (Singapura). A variação **entre corridas**
+  (desvio robusto) é 2,1 s e a dispersão **entre paradas** dentro de uma corrida, em mediana, 1,4 s.
+  Como a pista muda tanto o número, um prior geral é fraco: a melhor reserva seria o mesmo circuito
+  em edições anteriores (`circuit_history`, só anteriores, nunca posteriores).
+- **O banco só tem 2024, então não há edição anterior de nenhum circuito.** O caminho "mesmo
+  circuito" está implementado e testado com dados sintéticos, mas **não foi exercitado com dados
+  reais**: hoje a reserva é a mediana das outras corridas. Ingerir 2023 só com voltas (~10 s por
+  corrida) o habilitaria.
+- **Poucas paradas verdes** (menos de 10): Arábia Saudita, Mônaco e Catar, as corridas de uma parada
+  só ou com muito safety car. É onde o prior pesa.
+- **A premissa "paradas sob safety car custam bem menos" NÃO apareceu nesta medida.** As 24 paradas
+  fora da bandeira verde que dá para medir têm mediana 30,2 s, contra 22,7 s das verdes. Mas a medida
+  é contra o ritmo normal do próprio piloto, a amostra é pequena e enviesada (só entram paradas com
+  voltas verdes ao redor para servir de referência), e "custa menos" sob safety car é uma afirmação
+  **relativa ao pelotão**, que esta medida não captura. Não confirmo nem refuto: só mantive essas
+  paradas fora da estimativa verde.
 
 
 <details>
@@ -764,6 +795,8 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   `predictive_sd` é conservador num sentido e curto em outro, e a causa do déficit não foi identificada.
 - **Stints curtos (6 a 8 voltas) ainda têm erro-padrão ~8% curto** (cobertura 92%, mesmo com HC3 e
   t de Student), e o Huber, com tão poucas voltas, pode tratar como outlier uma volta que é só ruído.
+- **O caminho "mesmo circuito, edições anteriores" da perda no pit não foi validado com dados
+  reais**: o banco só tem 2024 (ver acima).
 - **0,03 s/kg não foi validado de forma independente.** É uma suposição de engenharia; os dados só
   dizem que o `k` total (combustível + pista) é parecido com ele em 20 de 21 corridas, o que não
   prova que o combustível sozinho vale isso.
@@ -807,7 +840,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação (puro)
+strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit (puro)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

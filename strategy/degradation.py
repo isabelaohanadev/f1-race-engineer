@@ -49,7 +49,7 @@ import logging
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from statistics import median
@@ -68,6 +68,7 @@ from strategy.fuel import (
 )
 from strategy.laps import LapRow, load_race_laps
 from strategy.population import split_population
+from strategy.priors import DEFAULT_PRIORS, Priors
 from strategy.regression import fit_within
 from strategy.tables import pct, render_markdown, render_text
 
@@ -76,16 +77,11 @@ MIN_UNIT_LAPS = 6  # um (piloto, composto) com menos voltas não ganha inclinaç
 MIN_DF_TAU = 3  # graus de liberdade mínimos para estimar a variação entre pilotos/stints
 MIN_SIGMA_LAPS = 100  # menos resíduos que isto: o ruído do composto usa o da corrida
 SE_FLOOR = 1e-4  # um ajuste perfeito não pode dar erro-padrão zero (peso infinito)
-# Variação entre pilotos/stints (s por volta de idade) quando a corrida ainda não tem dados para
-# estimá-la (poucos (piloto, composto) identificáveis). É a mediana das estimativas das 21 corridas
-# secas de 2024 com a corrida inteira (0,0222; de 0,010 a 0,073): vem DESTES dados, então um
-# backtest estrito deveria recalculá-la sem a corrida testada.
-TAU_FALLBACK = 0.022
-# Piso para o quanto dois compostos diferem em degradação, no último recurso (prever um composto que
-# ninguém rodou). Com 2 compostos conhecidos e parecidos (HARD e MEDIUM quase iguais na Arábia
-# Saudita e no Catar) o desvio amostral sai ~0 e engana. É a mediana, nas 21 corridas secas de 2024,
-# do desvio entre as médias dos compostos (0,0174): vem DESTES dados, como o TAU_FALLBACK.
-BETWEEN_COMPOUNDS_FLOOR = 0.017
+# Os valores de reserva (variação entre pilotos/stints quando a corrida ainda não tem dados para
+# estimá-la, e o piso da diferença entre compostos no último recurso) vêm de `strategy.priors`: o
+# padrão abaixo usa as 21 corridas todas, e um backtest passa `priors=` sem a corrida avaliada.
+TAU_FALLBACK = DEFAULT_PRIORS.tau
+BETWEEN_COMPOUNDS_FLOOR = DEFAULT_PRIORS.between_compounds
 Z95 = 1.96
 FUTURE_FRACTION = 0.5  # a calibração prevê os stints que começam depois de metade da corrida
 
@@ -102,7 +98,7 @@ def random_effects_mean(slopes: np.ndarray, ses: np.ndarray, tau: float) -> tupl
 
 
 def estimate_tau(
-    slopes: np.ndarray, ses: np.ndarray, strata: Sequence[str]
+    slopes: np.ndarray, ses: np.ndarray, strata: Sequence[str], fallback: float = TAU_FALLBACK
 ) -> tuple[float, Literal["estimado", "padrão"]]:
     """Variação REAL da inclinação entre unidades (pilotos/stints), por DerSimonian-Laird.
 
@@ -124,7 +120,7 @@ def estimate_tau(
         c += float(np.sum(w) - np.sum(w**2) / np.sum(w))
         df += int(mask.sum()) - 1
     if df < MIN_DF_TAU or c <= 0:
-        return TAU_FALLBACK, "padrão"
+        return fallback, "padrão"
     return float(np.sqrt(max(0.0, (q - df) / c))), "estimado"
 
 
@@ -183,6 +179,7 @@ class DegradationModel:
     # último recurso: prever um composto que ninguém rodou ainda pela média dos outros.
     between_compounds: float | None
     units: dict[tuple[str, str], SlopeEstimate]
+    between_floor: float = BETWEEN_COMPOUNDS_FLOOR  # o piso usado no último recurso (de `Priors`)
 
     def slope(self, driver: str, compound: str) -> SlopeEstimate | None:
         """A degradação a usar para `driver` em `compound`: o dado dele (encolhido), senão a média
@@ -202,7 +199,7 @@ class DegradationModel:
                 self.between_compounds
                 if self.between_compounds is not None
                 else abs(self.pooled.mean),
-                BETWEEN_COMPOUNDS_FLOOR,
+                self.between_floor,
             )
             return self._from_prior(
                 driver, compound, self.pooled, extra=spread, source="todos os compostos"
@@ -276,11 +273,19 @@ def fit_degradation(
     upto_lap: int,
     total_laps: int,
     variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
+    priors: Priors = DEFAULT_PRIORS,
+    kappa: float | None = None,
 ) -> DegradationModel:
-    """O modelo de degradação da corrida na volta `upto_lap`, só com o que se sabia nela."""
+    """O modelo de degradação da corrida na volta `upto_lap`, só com o que se sabia nela.
+
+    `priors`: as constantes de reserva (use `leave_one_out` num backtest). `kappa`: força o `k`
+    (para medir o quanto o resultado depende dele); o padrão é o da variante, estimado só com o
+    que se sabia na volta."""
     visible = laps_until(rows, upto_lap)  # PRIMEIRO passo: nada do futuro passa daqui
     laps = dry_clean_laps(visible)
     fuel = fuel_coefficient(visible, upto_lap=upto_lap, total_laps=total_laps, variant=variant)
+    if kappa is not None:
+        fuel = replace(fuel, kappa=kappa)
     units, residuals = _units(laps, fuel.kappa)
 
     all_residuals = [value for values in residuals.values() for value in values]
@@ -297,17 +302,18 @@ def fit_degradation(
             fuel,
             sigma_race,
             sigma_by_compound,
-            TAU_FALLBACK,
+            priors.tau,
             "padrão",
             {},
             None,
             None,
             {},
+            priors.between_compounds,
         )
 
     slopes = np.array([u.slope for u in units])
     ses = np.array([u.se for u in units])
-    tau, tau_source = estimate_tau(slopes, ses, [u.compound for u in units])
+    tau, tau_source = estimate_tau(slopes, ses, [u.compound for u in units], priors.tau)
 
     compounds: dict[str, CompoundPrior] = {}
     for compound in sorted({u.compound for u in units}):
@@ -352,6 +358,7 @@ def fit_degradation(
         pooled,
         between,
         estimates,
+        priors.between_compounds,
     )
 
 
