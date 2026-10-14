@@ -8,12 +8,27 @@ x-postgres-env: &postgres-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-f1_dev_password}
   POSTGRES_DB: ${POSTGRES_DB:-f1_race_engineer}
 
+# Base comum de tudo que roda o código do projeto (app agora; migrate e, na Fase 2, workers).
+# A mesma `image:` nos dois serviços faz ambos usarem a MESMA imagem; o segundo build é só
+# cache hit. O banco é alcançado pelo nome do serviço (db) e pela porta interna (5432).
+x-app-base: &app-base
+  build: .
+  image: f1-race-engineer:local
+  environment:
+    <<: *postgres-env
+    POSTGRES_HOST: db
+    POSTGRES_PORT: "5432"
+    FASTF1_CACHE_DIR: /cache/fastf1
+
 services:
   db:
     # Imagem oficial do Postgres 16 com a extensão TimescaleDB já instalada. Usamos Timescale
     # porque a telemetria de posição é uma série temporal enorme (milhões de linhas por
     # corrida): hypertables particionam por tempo e dão compressão e consultas por janela rápidas.
-    image: timescale/timescaledb:latest-pg16
+    # Versão FIXADA (não `latest`): a extensão vive dentro do volume de dados, e trocar a versão
+    # do binário por baixo de um volume existente exige `ALTER EXTENSION ... UPDATE`. Fixar evita
+    # que um `docker compose pull` mude o comportamento das migrations sem ninguém perceber.
+    image: timescale/timescaledb:2.30.2-pg16
     restart: unless-stopped
     environment: *postgres-env
     ports:
@@ -23,20 +38,29 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       # "$$" evita que o Compose interpole; quem expande a variável é o shell do container.
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # `-h 127.0.0.1` força TCP de propósito: no primeiro boot a imagem roda um servidor
+      # TEMPORÁRIO (só socket Unix) para os scripts de init. Sem -h, o pg_isready acharia que o
+      # banco está pronto cedo demais e o `migrate` (que conecta por TCP) falharia na 1ª subida.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+  # Job one-shot: aplica as migrations e termina. Fica separado do app de propósito: se o app
+  # rodasse `alembic upgrade` ao subir, várias réplicas (ou, na Fase 2, vários workers na mesma
+  # imagem) disputariam a migration ao mesmo tempo. Aqui ela roda exatamente uma vez por `up`,
+  # e quem depende do schema espera por `service_completed_successfully`.
+  migrate:
+    <<: *app-base
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
   app:
-    build: .
+    <<: *app-base
     restart: unless-stopped
-    environment:
-      <<: *postgres-env
-      # Dentro da rede do compose o banco é alcançado pelo nome do serviço, na porta interna.
-      POSTGRES_HOST: db
-      POSTGRES_PORT: "5432"
-      FASTF1_CACHE_DIR: /cache/fastf1
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
@@ -46,6 +70,9 @@ services:
       db:
         # Só sobe o app quando o Postgres está aceitando conexões (não apenas "container iniciado").
         condition: service_healthy
+      migrate:
+        # ...e depois que o schema foi criado/atualizado com sucesso.
+        condition: service_completed_successfully
     healthcheck:
       # A imagem slim não tem curl; usamos o próprio Python.
       test:
