@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>F1 Race Engineer: stream</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #667085; --line: #d9dde3;
+      --accent: #d6291f; --ok: #12805c; --warn: #b54708;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0f1216; --panel: #181c22; --text: #e8eaed; --muted: #98a2b3; --line: #2b323b;
+              --accent: #ff5a4d; --ok: #3ccf91; --warn: #f7b955; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+           font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    h1 { font-size: 18px; margin: 0; }
+    h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em;
+         color: var(--muted); }
+    .badge { padding: 2px 10px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+    .badge.on { color: var(--ok); border-color: var(--ok); }
+    .badge.off { color: var(--muted); }
+    .badge.retry { color: var(--warn); border-color: var(--warn); }
+    .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+    .bar label { display: inline-flex; gap: 4px; align-items: center; color: var(--muted); }
+    .sep { flex: 0 0 1px; height: 22px; background: var(--line); margin: 0 4px; }
+    input[type=number] { width: 72px; }
+    input, select, button { font: inherit; color: inherit; background: var(--panel);
+      border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+    button { cursor: pointer; }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+    .muted { color: var(--muted); margin: 0 0 12px; min-height: 1.45em; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px;
+             margin-bottom: 12px; }
+    .stat, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+                    padding: 10px 12px; }
+    .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 12px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); }
+    th:nth-child(-n+2), td:nth-child(-n+2) { text-align: left; }
+    th { color: var(--muted); font-weight: 500; }
+    pre { margin: 8px 0 0; max-height: 360px; overflow: auto; font: 12px/1.4 ui-monospace, Menlo, monospace;
+          white-space: pre-wrap; word-break: break-all; }
+    details { margin-top: 12px; }
+    summary { cursor: pointer; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>F1 Race Engineer: stream ao vivo</h1>
+    <span id="conn" class="badge off">desconectado</span>
+  </header>
+
+  <div class="bar">
+    <label>Ano <input id="year" type="number" value="2024" min="1950" max="2100"></label>
+    <label>Etapa <input id="round" type="number" value="21" min="1" max="50"></label>
+    <button id="connect">Conectar</button>
+    <button id="disconnect" disabled>Desconectar</button>
+    <span class="sep"></span>
+    <label>Velocidade
+      <select id="speed"><option>1</option><option>4</option><option selected>16</option></select>x
+    </label>
+    <button id="start">Iniciar replay</button>
+    <button id="pause">Pausar</button>
+    <button id="resume">Retomar</button>
+    <button id="apply-speed">Aplicar velocidade</button>
+    <button id="stop">Parar</button>
+  </div>
+  <p id="api-reply" class="muted"></p>
+
+  <section class="stats">
+    <div class="stat"><b id="st-events">0</b><span>eventos recebidos</span></div>
+    <div class="stat"><b id="st-rate">0</b><span>eventos/s</span></div>
+    <div class="stat"><b id="st-epoch">-</b><span>epoch (replay)</span></div>
+    <div class="stat"><b id="st-race">-</b><span>corrida</span></div>
+    <div class="stat"><b id="st-replay">-</b><span>replay</span></div>
+  </section>
+
+  <main class="grid">
+    <section class="panel">
+      <h2>Classificação (ordem na pista)</h2>
+      <table>
+        <thead><tr><th>#</th><th>Piloto</th><th>Voltas</th><th>Última</th><th>Pneu</th><th>x</th><th>y</th></tr></thead>
+        <tbody id="standings"></tbody>
+      </table>
+    </section>
+    <section class="panel">
+      <h2>Eventos recebidos</h2>
+      <label class="muted"><input id="show-positions" type="checkbox"> mostrar eventos de posição
+        (são ~99% do volume)</label>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <details>
+    <summary>Snapshot recebido ao conectar</summary>
+    <pre id="snapshot"></pre>
+  </details>
+
+  <script src="race_view.js"></script>
+  <script>
+    (() => {
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const view = new RaceView();
+      const MAX_LOG_LINES = 200;
+      const RETRY_MS = 2000;
+
+      let socket = null;
+      let wantOpen = false;
+      let retryTimer = null;
+      let events = 0;
+      let windowCount = 0;
+      let rate = 0;
+      let replay = null;
+      const logLines = [];
+
+      const raceKey = () => ({ year: $("year").value, round: $("round").value });
+
+      function setConnection(text, kind) {
+        const badge = $("conn");
+        badge.textContent = text;
+        badge.className = "badge " + kind;
+      }
+
+      function log(line) {
+        logLines.push(line);
+        if (logLines.length > MAX_LOG_LINES) logLines.shift(); // o log tem tamanho máximo: sem vazamento
+      }
+
+      function connect() {
+        disconnect(false);
+        const { year, round } = raceKey();
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        wantOpen = true;
+        setConnection("conectando...", "retry");
+        socket = new WebSocket(`${proto}//${location.host}/ws/races/${year}/${round}`);
+        $("connect").disabled = true;
+        $("disconnect").disabled = false;
+        socket.onopen = () => setConnection("conectado", "on");
+        socket.onmessage = (event) => handleMessage(event.data);
+        socket.onclose = (event) => {
+          socket = null;
+          if (!wantOpen) return;
+          const why = event.code === 1013 ? "cliente lento demais (1013)" : `fechado (${event.code})`;
+          setConnection(`${why}: reconectando...`, "retry");
+          log(`-- conexão encerrada: ${why}; tentando de novo em ${RETRY_MS / 1000} s`);
+          retryTimer = setTimeout(connect, RETRY_MS);
+        };
+      }
+
+      function disconnect(user = true) {
+        if (user) wantOpen = false;
+        clearTimeout(retryTimer);
+        if (socket) { socket.onclose = null; socket.close(); socket = null; }
+        if (user) {
+          setConnection("desconectado", "off");
+          $("connect").disabled = false;
+          $("disconnect").disabled = true;
+        }
+      }
+
+      function handleMessage(raw) {
+        const message = JSON.parse(raw);
+        if (message.type === "snapshot") {
+          view.applySnapshot(message);
+          replay = message.replay;
+          $("snapshot").textContent = JSON.stringify(message, null, 2);
+          log(`-- snapshot: epoch ${message.epoch}, ${Object.keys(message.cars).length} carros, as_of ${message.as_of}`);
+          return;
+        }
+        view.applyEvent(message);
+        events += 1;
+        windowCount += 1;
+        // Posições são quase todo o volume: só vão para o log se o usuário pedir.
+        if (message.type !== "position" || $("show-positions").checked) log(raw);
+      }
+
+      const fmt = (n) => n.toLocaleString("pt-BR");
+      const lapTime = (ms) => (ms == null ? "-" : (ms / 1000).toFixed(3) + " s");
+
+      function render() {
+        $("st-events").textContent = fmt(events);
+        $("st-rate").textContent = fmt(rate);
+        $("st-epoch").textContent = view.epoch || "-";
+        const race = view.race;
+        $("st-race").textContent = race.state ? `${race.state}, volta ${race.lap}/${race.total_laps ?? "?"}` : "-";
+        $("st-replay").textContent = replay ? `${replay.state}, ${replay.speed}x` : "-";
+
+        const rows = view.classification().map((code, index) => {
+          const car = view.cars[code];
+          const row = document.createElement("tr");
+          const cells = [index + 1, code, car.lap ?? "-", lapTime(car.lap_time_ms), car.compound ?? "-", car.x ?? "-", car.y ?? "-"];
+          for (const value of cells) {
+            const cell = document.createElement("td");
+            cell.textContent = String(value); // textContent, nunca innerHTML: o que vem da rede é só texto
+            row.appendChild(cell);
+          }
+          return row;
+        });
+        $("standings").replaceChildren(...rows);
+
+        const logEl = $("log");
+        const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
+        logEl.textContent = logLines.join("\n");
+        if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      async function api(path, body) {
+        try {
+          const response = await fetch(path, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: body ? JSON.stringify(body) : undefined,
+          });
+          const data = await response.json().catch(() => ({}));
+          if (data.state) replay = { state: data.state, speed: data.speed };
+          const detail = data.detail ? JSON.stringify(data.detail) : data.state ? `${data.state} a ${data.speed}x` : "";
+          $("api-reply").textContent = `POST ${path} -> ${response.status} ${detail}`;
+        } catch (error) {
+          $("api-reply").textContent = `POST ${path} falhou: ${error}`;
+        }
+      }
+
+      // O painel "replay" segue o estado REAL (lido do Redis pela API), não só a resposta do último
+      // POST: o replay pode ser controlado por outra instância, e `pending` vira `running` sozinho.
+      async function refreshReplay() {
+        const { year, round } = raceKey();
+        try {
+          const response = await fetch(`/replay/${year}/${round}`);
+          replay = response.ok ? await response.json() : null;
+        } catch (error) {
+          /* API fora do ar: mantém o último estado conhecido */
+        }
+      }
+
+      const replayPath = (action) => { const { year, round } = raceKey(); return `/replay/${year}/${round}/${action}`; };
+      const speed = () => Number($("speed").value);
+
+      $("connect").addEventListener("click", connect);
+      $("disconnect").addEventListener("click", () => disconnect(true));
+      $("start").addEventListener("click", () => api(replayPath("start"), { speed: speed() }));
+      $("pause").addEventListener("click", () => api(replayPath("pause")));
+      $("resume").addEventListener("click", () => api(replayPath("resume")));
+      $("apply-speed").addEventListener("click", () => api(replayPath("speed"), { speed: speed() }));
+      $("stop").addEventListener("click", () => api(replayPath("stop")));
+
+      // A tela atualiza 4x por segundo (não a cada evento: são ~1.000 por segundo a 16x).
+      setInterval(render, 250);
+      setInterval(() => { rate = windowCount; windowCount = 0; }, 1000);
+      setInterval(refreshReplay, 2000);
+      refreshReplay();
+
+      connect();
+    })();
+  </script>
+</body>
+</html>

@@ -1,7 +1,9 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app import metrics
 from app.errors import register_exception_handlers
@@ -59,3 +61,10 @@ app.include_router(races.router)
 app.include_router(replay.router)
 app.include_router(ws.router)
 app.include_router(metrics_router.router)
+
+# Página de teste do WebSocket (frontend/index.html): servida pela PRÓPRIA API, então fica na mesma
+# origem do WebSocket e dos endpoints /replay (sem CORS). `html=True` serve o index.html em
+# /frontend/. Só é montada se a pasta existir: a API nunca deixa de subir por causa da página.
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+if FRONTEND_DIR.is_dir():
+    app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

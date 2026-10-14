@@ -289,7 +289,7 @@ curl -s "localhost:8000/races/2024/21/laps?driver=VER" | head -c 600
 curl -X POST localhost:8000/replay/2024/21/start -H 'content-type: application/json' -d '{"speed": 16}'
 ```
 
-Duas formas de ver o stream (as duas imprimem o snapshot e depois os eventos):
+Três formas de ver o stream (as duas primeiras imprimem o snapshot e depois os eventos):
 
 ```bash
 # a) com websocat (https://github.com/vi/websocat)
@@ -299,6 +299,15 @@ websocat ws://localhost:8000/ws/races/2024/21 | head -n 20
 python scripts/watch_race.py --year 2024 --round 21            # resumo a cada segundo
 python scripts/watch_race.py --year 2024 --round 21 --events   # cada evento (muito volume)
 ```
+
+```text
+c) no navegador: http://localhost:8000/frontend/
+```
+
+A página (`frontend/`, HTML e JS puros, sem build, servida pela própria API) conecta sozinha, mostra
+o snapshot, os contadores, a classificação ao vivo e o log de eventos, e tem botões para iniciar,
+pausar, retomar, mudar a velocidade e parar o replay. Os eventos de posição (~99% do volume) só vão
+para o log se você marcar a opção, senão a tela seria ilegível a 16x.
 
 O `scripts/watch_race.py` é também um **cliente de referência**: a classe `RaceView` implementa, em
 ~40 linhas, as regras do protocolo (ver abaixo) e é a mesma que os testes validam.
@@ -352,6 +361,7 @@ python -m worker                  # terminal 2: o worker (inicie mais cópias se
 | `POST /replay/{year}/{round}/speed` | Muda para 1x, 4x ou 16x sem reiniciar nem pular | `200` · `409` · `422` · `504` |
 | `GET /replay/{year}/{round}` | Status do replay, lido do Redis (vale de qualquer instância) | `200` · `404` nunca iniciado ou expirado |
 | `WS /ws/races/{year}/{round}` | Snapshot do estado e, depois, os eventos em tempo real | fecha com `1013` se o cliente for lento |
+| `GET /frontend/` | Página de teste do WebSocket (HTML + JS, servida pela API) | `200` |
 
 Regras que valem a pena conhecer:
 
@@ -481,7 +491,9 @@ pytest                            # tudo; requer banco e Redis (docker compose u
 
 - **Unitários:** SQLite em memória com dados semeados à mão e DataFrames sintéticos com as mesmas
   colunas e tipos do FastF1; o motor de replay usa um **relógio injetado** (nada de `sleep` real, o
-  teste roda uma hora de corrida em milissegundos e confere o instante exato de cada evento).
+  teste roda uma hora de corrida em milissegundos e confere o instante exato de cada evento). O
+  `tests/test_frontend.py` roda o JS da página no `node` e o compara com o cliente Python em 60
+  cenários aleatórios (é pulado se o `node` não existir).
 - **Integração** (marker `integration`): **TimescaleDB e Redis reais**. Cada execução cria um banco
   descartável (a migration roda de verdade) e usa o banco lógico 15 do Redis, esvaziado a cada
   teste, então seus dados de desenvolvimento nunca são tocados. Cobrem o que um dublê não alcança:
@@ -573,6 +585,12 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   além do retry do cliente (~4 s), o replay termina como `failed`.
 - **Um único Redis**, sem alta disponibilidade, e a API não tem autenticação (nem REST, nem
   WebSocket, nem `/metrics`): é um projeto de portfólio, não um serviço para a internet aberta.
+- **A página não foi aberta num navegador de verdade.** Não havia navegador na máquina de
+  desenvolvimento. O que foi verificado: a API a serve; as regras do protocolo (`race_view.js`)
+  chegam ao mesmo estado que o cliente Python em 60 cenários aleatórios (teste de conformidade, JS
+  rodado no `node`); e o script da página foi executado no `node` com um DOM de mentira e o
+  WebSocket e o `fetch` reais (conectar, iniciar, pausar, mudar a velocidade, retomar, parar). O
+  CSS e o layout não foram vistos.
 - **`websocat`**: o comando acima segue o protocolo e é equivalente ao do script Python, mas só o
   script e o cliente dos testes foram executados contra o servidor.
 
@@ -586,6 +604,7 @@ worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
+frontend/       página de teste do WebSocket (HTML + JS, sem build), servida pela API
 tests/          unitários, ingestion/, replay/ e integration/ (Timescale e Redis reais)
 .github/        workflow de CI
 docker-compose.yml · Dockerfile · .env.example
