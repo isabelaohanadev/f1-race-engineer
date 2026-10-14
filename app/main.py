@@ -4,11 +4,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.errors import register_exception_handlers
+from app.hub import HubRegistry
 from app.redis_client import create_redis
-from app.routers import health, races, replay
+from app.routers import health, races, replay, ws
 from db.session import get_session_factory
 from replay.control import RedisControlPlane
 from replay.manager import ReplayManager
+from replay.state import RaceStateStore
 
 
 @asynccontextmanager
@@ -19,11 +21,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = redis
     app.state.control = RedisControlPlane(redis)
     app.state.replay_manager = ReplayManager(get_session_factory(), redis)
+    app.state.state_store = RaceStateStore(redis)
+    app.state.hubs = HubRegistry(redis)
     try:
         yield
     finally:
         # Para os replays que ESTA instância roda e libera os locks (senão a corrida ficaria
         # "em replay em outro processo" até o TTL do lock expirar).
+        await app.state.hubs.close()  # solta os leitores do stream e fecha as filas dos clientes
         await app.state.replay_manager.shutdown()
         await redis.aclose()
 
@@ -39,3 +44,4 @@ register_exception_handlers(app)
 app.include_router(health.router)
 app.include_router(races.router)
 app.include_router(replay.router)
+app.include_router(ws.router)

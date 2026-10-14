@@ -1,12 +1,14 @@
 from collections.abc import Iterator
 
-from fastapi import Request
 from redis.asyncio import Redis
 from sqlalchemy.orm import Session
+from starlette.requests import HTTPConnection
 
+from app.hub import HubRegistry
 from db.session import get_session_factory
 from replay.control import RedisControlPlane
 from replay.manager import ReplayManager
+from replay.state import RaceStateStore
 
 
 def get_db() -> Iterator[Session]:
@@ -21,7 +23,7 @@ def get_db() -> Iterator[Session]:
         yield session
 
 
-def get_redis(request: Request) -> Redis:
+def get_redis(request: HTTPConnection) -> Redis:
     """Dependência do FastAPI: o cliente Redis ÚNICO da aplicação, criado no lifespan (main.py).
 
     Um cliente por processo (e não por request): ele já mantém um pool de conexões. Nos testes,
@@ -30,12 +32,21 @@ def get_redis(request: Request) -> Redis:
     return request.app.state.redis
 
 
-def get_replay_manager(request: Request) -> ReplayManager:
+def get_replay_manager(request: HTTPConnection) -> ReplayManager:
     """O gerenciador de replays DESTA instância (criado no lifespan). Só serve para `start`: o
     resto do controle vai pelo Redis (ver get_control), para funcionar de qualquer instância."""
     return request.app.state.replay_manager
 
 
-def get_control(request: Request) -> RedisControlPlane:
+def get_control(request: HTTPConnection) -> RedisControlPlane:
     """O plano de controle (status e comandos) sobre o Redis: o mesmo em todas as instâncias."""
     return request.app.state.control
+
+
+def get_hubs(connection: HTTPConnection) -> HubRegistry:
+    """Os hubs de distribuição de eventos desta instância (um por corrida com clientes)."""
+    return connection.app.state.hubs
+
+
+def get_state_store(connection: HTTPConnection) -> RaceStateStore:
+    return connection.app.state.state_store

@@ -11,8 +11,9 @@ O tempo `t` de todo evento é o instante DA CORRIDA em milissegundos desde a ép
 inteiro: sem ambiguidade de fuso, comparação trivial e é o que o motor usa para dar o ritmo.
 """
 
+import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import ClassVar, Literal
 
@@ -202,3 +203,11 @@ def id_before(entry_id: str) -> str:
     if ms > 0:
         return f"{ms - 1}-{_MAX_SEQ}"
     return "0-0"
+
+
+def entry_to_json(entry: StreamEntry) -> str:
+    """A mensagem que o WebSocket envia por evento: o evento com tipos de verdade (inteiros e null,
+    não strings), mais `id` (o ID do stream, para o cliente deduplicar/retomar) e `epoch`."""
+    message = {"type": entry.event.type, "id": entry.id, "epoch": entry.epoch}
+    message |= asdict(entry.event)
+    return json.dumps(message, separators=(",", ":"))

@@ -28,7 +28,7 @@ _ERRORS = {
 }
 
 
-def _out(info: ReplayInfo) -> ReplayStatusOut:
+def to_status_out(info: ReplayInfo) -> ReplayStatusOut:
     s = info.status
     return ReplayStatusOut(
         state=s.state.value,  # type: ignore[arg-type]
@@ -48,7 +48,7 @@ def _result_out(result: CommandResult) -> ReplayStatusOut:
     if not result.ok or result.info is None:
         # O dono rejeitou o comando (ex.: velocidade inválida que passou pela validação do corpo).
         raise InvalidSpeed(result.detail or result.error or "comando rejeitado")
-    return _out(result.info)
+    return to_status_out(result.info)
 
 
 @router.post(
@@ -89,7 +89,7 @@ async def start_replay(
     info = await control.get_info(year, round_number)  # o status que o start acabou de publicar
     if info is None:  # expirou entre o start e a leitura (Redis lento demais): trata como fora
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "status do replay indisponível")
-    return _out(info)
+    return to_status_out(info)
 
 
 @router.get(
@@ -107,7 +107,7 @@ async def get_replay_status(
             status.HTTP_404_NOT_FOUND,
             detail=f"Não há replay da corrida {year}/{round_number} (nunca iniciado ou expirado).",
         )
-    return _out(info)
+    return to_status_out(info)
 
 
 @router.post("/{year}/{round}/pause", response_model=ReplayStatusOut, responses=_ERRORS)
