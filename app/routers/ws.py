@@ -34,11 +34,13 @@ from fastapi import APIRouter, Depends, Path, WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from app import metrics
 from app.deps import get_control, get_hubs, get_redis, get_state_store
 from app.hub import HubRegistry, Subscription
 from app.routers.replay import to_status_out
 from replay.control import RedisControlPlane
 from replay.events import entry_to_json, id_tuple, parse_entry
+from replay.latency import seconds_since
 from replay.state import RaceSnapshot, RaceStateStore
 
 logger = logging.getLogger(__name__)
@@ -99,12 +101,14 @@ async def send_with_timeout(ws: WebSocketLike, payload: str, timeout_s: float) -
 
 async def _send_loop(ws: WebSocketLike, sub: Subscription, timeout_s: float) -> None:
     while True:
-        payload = await sub.queue.get()
-        if payload is None:  # a fila foi encerrada
+        delivery = await sub.queue.get()
+        if delivery is None:  # a fila foi encerrada
             if sub.overflowed:
                 raise SlowClient("a fila do cliente encheu")
             return
-        await send_with_timeout(ws, payload, timeout_s)
+        await send_with_timeout(ws, delivery.payload, timeout_s)
+        if delivery.published_ms is not None:
+            metrics.DELIVERY_LATENCY.observe(seconds_since(delivery.published_ms))
 
 
 async def _watch_disconnect(ws: WebSocketLike) -> None:
@@ -148,6 +152,7 @@ async def race_websocket(
     redis: Annotated[Redis, Depends(get_redis)],
 ) -> None:
     await websocket.accept()
+    metrics.WS_CONNECTIONS.inc()
     hub = sub = None
     try:
         hub, sub = await hubs.subscribe(year, round_number)  # passo 0: a fila já está ouvindo
@@ -163,6 +168,7 @@ async def race_websocket(
         pass  # o cliente foi embora: normal
     except SlowClient as exc:
         logger.info("Cliente WebSocket lento desconectado: %s", exc)
+        metrics.WS_SLOW_DISCONNECTS.inc()
         with contextlib.suppress(Exception):
             await websocket.close(code=CLOSE_TRY_AGAIN_LATER, reason="cliente lento demais")
     except RedisError:

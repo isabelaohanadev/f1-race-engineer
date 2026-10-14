@@ -149,6 +149,13 @@ services:
       # Só o Redis: sem credenciais do Postgres (menor privilégio).
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      # O worker é um processo à parte da API: expõe o SEU /metrics, nesta porta (0 desliga).
+      WORKER_METRICS_PORT: "9108"
+    ports:
+      # Porta do HOST efêmera (sorteada pelo Docker) e só em loopback: com `--scale worker=N` uma
+      # porta fixa daria conflito. Para achar a da cópia 1: `docker compose port --index 1 worker 9108`.
+      # Dentro da rede do Compose o Prometheus raspa `worker:9108` (DNS devolve todas as cópias).
+      - "127.0.0.1::9108"
     depends_on:
       redis:
         condition: service_healthy

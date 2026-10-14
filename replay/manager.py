@@ -104,11 +104,13 @@ class ReplayManager:
         state: StateRegistry | None = None,
         control: ControlPlane | None = None,
         owner: str | None = None,
+        on_events_published: Callable[[int], None] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._session_factory = session_factory
         self._clock = clock
         self._page_size = page_size
+        self._on_events_published = on_events_published
         self._sleep = sleep  # do heartbeat do lock; injetável para os testes não esperarem
         self._lock_factory = lock_factory or (
             lambda year, rnd: ReplayLock(redis, lock_key(year, rnd), lock_ttl_ms)
@@ -175,7 +177,13 @@ class ReplayManager:
                 await self._state.register_stream(year, round_number)  # os workers o descobrem
                 await publisher.reset()
                 await self._control.reset(year, round_number)  # fila de comandos limpa
-                engine = ReplayEngine(source, publisher, clock=self._clock, speed=speed)
+                engine = ReplayEngine(
+                    source,
+                    publisher,
+                    clock=self._clock,
+                    speed=speed,
+                    on_published=self._on_events_published,
+                )
                 run = _Run(year, round_number, epoch, engine, lock)
                 # O status existe ANTES de o start devolver: um `POST /pause` que chegue em outra
                 # instância logo em seguida já encontra o replay (e o comando fica na fila até o

@@ -11,161 +11,30 @@ aplicando eventos, perde ou corrompe alguma coisa? O critério é duplo:
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
 
 import pytest
-import uvicorn
 import websockets
 from redis.asyncio import Redis
-from sqlalchemy import Engine
-from sqlalchemy.orm import sessionmaker
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from app.config import get_redis_settings
-from app.deps import get_redis
 from app.main import app
 from replay.engine import ReplayState
 from replay.events import PositionEvent, id_tuple
 from replay.manager import ReplayManager
 from replay.publisher import StreamPublisher
-from replay.state import RaceStateStore, classify
-from tests.integration.helpers import RACE, STREAM, drained, make_worker, running, wait_until
-from tests.replay.conftest import ALB, NOR, VER, at, seed_race
-
-RANK = {"started": 0, "running": 1, "finished": 2}
-
-
-# ---------------------------------------------------------------- o "cliente": reconstrói o estado
-
-
-class ClientView:
-    """O que um cliente faz com o que recebe. As regras são as DOCUMENTADAS no protocolo:
-    epoch maior = replay novo (descarta tudo); por piloto, uma posição só vale se `t` > `pos_t`, e
-    uma volta se `t` > `lap_t`; o status da corrida só avança em (volta, estado). Com isso,
-    repetições e atrasos (o catch-up pode repetir o que o snapshot já tinha) são inofensivos."""
-
-    def __init__(self) -> None:
-        self.epoch = 0
-        self.race: dict = {}
-        self.cars: dict[str, dict] = {}
-
-    def apply_snapshot(self, message: dict) -> None:
-        self.epoch = message["epoch"]
-        self.race = dict(message["race"])
-        self.cars = {code: dict(car) for code, car in message["cars"].items()}
-
-    def apply_event(self, message: dict) -> None:
-        if message["epoch"] < self.epoch:
-            return  # evento de um replay antigo
-        if message["epoch"] > self.epoch:
-            self.epoch, self.race, self.cars = message["epoch"], {}, {}  # replay novo
-        match message["type"]:
-            case "position":
-                car = self.cars.setdefault(message["driver"], {})
-                if car.get("pos_t", -1) < message["t"]:
-                    car |= {"x": message["x"], "y": message["y"], "pos_t": message["t"]}
-            case "lap_completed":
-                car = self.cars.setdefault(message["driver"], {})
-                if car.get("lap_t", -1) < message["t"]:
-                    car |= {"lap": message["lap"], "lap_t": message["t"]}
-                    for name in ("lap_time_ms", "compound", "position"):
-                        if message[name] is None:
-                            car.pop(name, None)
-                        else:
-                            car[name] = message[name]
-            case "race_status":
-                current = (self.race.get("lap", 0), RANK.get(self.race.get("state", ""), -1))
-                if (message["lap"], RANK[message["state"]]) > current:
-                    self.race = {"state": message["state"], "lap": message["lap"]}
-                    if message["total_laps"] is not None:
-                        self.race["total_laps"] = message["total_laps"]
-
-    @property
-    def finished(self) -> bool:
-        return self.race.get("state") == "finished"
-
-    @property
-    def classification(self) -> list[str]:
-        return classify(self.cars)
-
-
-@dataclass
-class ClientRun:
-    view: ClientView
-    as_of: str
-    received_ids: list[str]
-
-
-async def run_client(url: str, *, until, timeout_s: float = 25.0) -> ClientRun:
-    """Conecta, aplica o snapshot e os eventos até `until(view)`; devolve o que viu."""
-    view, ids = ClientView(), []
-    async with asyncio.timeout(timeout_s), websockets.connect(url) as ws:
-        snapshot = json.loads(await ws.recv())
-        assert snapshot["type"] == "snapshot"
-        view.apply_snapshot(snapshot)
-        while not until(view):
-            message = json.loads(await ws.recv())
-            ids.append(message["id"])
-            view.apply_event(message)
-    return ClientRun(view, snapshot["as_of"], ids)
-
-
-# ---------------------------------------------------------------- servidor e dados
-
-
-@pytest.fixture
-async def server(monkeypatch: pytest.MonkeyPatch, redis_test_settings) -> AsyncIterator[str]:
-    """Um uvicorn de verdade, no MESMO loop do teste, no Redis de testes (banco 15)."""
-    # O stub de Redis do conftest raiz (para os testes da API) não vale aqui: este servidor é real.
-    app.dependency_overrides.pop(get_redis, None)
-    monkeypatch.setenv("REDIS_DB", str(redis_test_settings.db))
-    get_redis_settings.cache_clear()  # o lifespan lê a config daqui
-    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
-    instance = uvicorn.Server(config)
-    task = asyncio.create_task(instance.serve())
-    async with asyncio.timeout(10):
-        while not instance.started:
-            await asyncio.sleep(0.01)
-    port = instance.servers[0].sockets[0].getsockname()[1]
-    yield f"ws://127.0.0.1:{port}"
-    instance.should_exit = True
-    await asyncio.wait_for(task, 10)
-    get_redis_settings.cache_clear()
-
-
-@pytest.fixture
-def url(server: str) -> str:
-    return f"{server}/ws/races/{RACE[0]}/{RACE[1]}"
-
-
-@pytest.fixture
-def store(redis_client: Redis) -> RaceStateStore:
-    return RaceStateStore(redis_client)
-
-
-@pytest.fixture
-def synthetic_race(engine: Engine) -> sessionmaker:
-    """40 s de corrida, 3 pilotos com amostras a cada 220 ms (EMPATES de horário entre eles) e uma
-    volta a cada 10 s: ~550 eventos, que a 16x levam ~2,5 s de relógio de verdade."""
-    positions = [(d, at(i * 220), i, d) for i in range(182) for d in (VER, NOR, ALB)]
-    laps = [
-        (d, k, at(10_000 * k + 400 * d), 80_000 + k, "SOFT", d)
-        for k in range(1, 5)
-        for d in (VER, NOR, ALB)
-    ]
-    seed_race(engine, positions=positions, laps=laps, total_laps=4)
-    return sessionmaker(engine, expire_on_commit=False)
-
-
-async def final_truth(store: RaceStateStore, redis: Redis):
-    await wait_until(lambda: drained(redis), timeout_s=10)
-    return await store.snapshot(*RACE)
-
-
-async def stream_ids(redis: Redis) -> list[str]:
-    return [entry_id for entry_id, _ in await redis.xrange(STREAM)]
-
+from replay.state import RaceStateStore
+from tests.integration.helpers import (
+    RACE,
+    STREAM,
+    ClientRun,
+    drained,
+    final_truth,
+    make_worker,
+    run_client,
+    running,
+    stream_ids,
+    wait_until,
+)
 
 # ================================================================ TRAVA 2: sem buracos
 

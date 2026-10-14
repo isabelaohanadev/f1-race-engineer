@@ -64,3 +64,18 @@ class RedisSettings(BaseSettings):
 @lru_cache
 def get_redis_settings() -> RedisSettings:
     return RedisSettings()
+
+
+class WorkerSettings(BaseSettings):
+    """Configuração do processo worker (`python -m worker`). Prefixo WORKER_ nas variáveis."""
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_prefix="WORKER_")
+
+    # Porta do /metrics do worker. O worker é um processo à parte da API, então expõe o SEU
+    # /metrics numa porta própria (ver README: por que não o modo multiprocess). 0 desliga.
+    metrics_port: int = 9108
+
+
+@lru_cache
+def get_worker_settings() -> WorkerSettings:
+    return WorkerSettings()

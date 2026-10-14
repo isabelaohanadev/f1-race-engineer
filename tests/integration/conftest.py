@@ -13,6 +13,7 @@ Como funciona (e por que é seguro rodar na sua máquina):
       pytest -m integration         # roda só eles
 """
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
+import uvicorn
 from pydantic import ValidationError
 from redis import Redis as SyncRedis
 from redis.asyncio import Redis
@@ -29,9 +31,15 @@ from redis.exceptions import RedisError
 from redis.retry import Retry
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import sessionmaker
 
-from app.config import RedisSettings, Settings
+from app.config import RedisSettings, Settings, get_redis_settings
+from app.deps import get_redis
+from app.main import app
 from app.redis_client import create_redis
+from replay.state import RaceStateStore
+from tests.integration.helpers import RACE
+from tests.replay.conftest import ALB, NOR, VER, at, seed_race
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).parent
@@ -164,3 +172,50 @@ async def redis_client(redis_test_settings: RedisSettings) -> AsyncIterator[Redi
     finally:
         await client.flushdb()
         await client.aclose()
+
+
+# ------------------------------------------------------- servidor real e dados de streaming
+
+
+@pytest.fixture
+async def server(monkeypatch: pytest.MonkeyPatch, redis_test_settings) -> AsyncIterator[str]:
+    """Um uvicorn de verdade, no MESMO loop do teste, no Redis de testes (banco 15)."""
+    # O stub de Redis do conftest raiz (para os testes da API) não vale aqui: este servidor é real.
+    app.dependency_overrides.pop(get_redis, None)
+    monkeypatch.setenv("REDIS_DB", str(redis_test_settings.db))
+    get_redis_settings.cache_clear()  # o lifespan lê a config daqui
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
+    instance = uvicorn.Server(config)
+    task = asyncio.create_task(instance.serve())
+    async with asyncio.timeout(10):
+        while not instance.started:
+            await asyncio.sleep(0.01)
+    port = instance.servers[0].sockets[0].getsockname()[1]
+    yield f"ws://127.0.0.1:{port}"
+    instance.should_exit = True
+    await asyncio.wait_for(task, 10)
+    get_redis_settings.cache_clear()
+
+
+@pytest.fixture
+def url(server: str) -> str:
+    return f"{server}/ws/races/{RACE[0]}/{RACE[1]}"
+
+
+@pytest.fixture
+def store(redis_client: Redis) -> RaceStateStore:
+    return RaceStateStore(redis_client)
+
+
+@pytest.fixture
+def synthetic_race(engine: Engine) -> sessionmaker:
+    """40 s de corrida, 3 pilotos com amostras a cada 220 ms (EMPATES de horário entre eles) e uma
+    volta a cada 10 s: ~550 eventos, que a 16x levam ~2,5 s de relógio de verdade."""
+    positions = [(d, at(i * 220), i, d) for i in range(182) for d in (VER, NOR, ALB)]
+    laps = [
+        (d, k, at(10_000 * k + 400 * d), 80_000 + k, "SOFT", d)
+        for k in range(1, 5)
+        for d in (VER, NOR, ALB)
+    ]
+    seed_race(engine, positions=positions, laps=laps, total_laps=4)
+    return sessionmaker(engine, expire_on_commit=False)

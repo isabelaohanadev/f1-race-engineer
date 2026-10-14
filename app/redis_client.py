@@ -6,7 +6,10 @@ processo) tem o seu. Quem roda o loop é dono do cliente: cria com `create_redis
 (lifespan do FastAPI, `main()` do worker) e chama `await client.aclose()` ao terminar.
 """
 
+from redis import Redis as SyncRedis
 from redis.asyncio import Redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from app.config import RedisSettings, get_redis_settings
 
@@ -45,4 +48,26 @@ def create_redis(settings: RedisSettings | None = None) -> Redis:
         health_check_interval=30,
         # TCP keepalive: o sistema operacional detecta o outro lado sumido mesmo sem tráfego.
         socket_keepalive=True,
+    )
+
+
+def create_sync_redis(settings: RedisSettings | None = None) -> SyncRedis:
+    """Cliente SÍNCRONO, usado SÓ pelo collector de métricas na hora do scrape.
+
+    Por que síncrono: `Collector.collect()` do prometheus-client é síncrono e roda numa thread (o
+    endpoint /metrics é `def`, então o FastAPI o executa no threadpool, sem bloquear o event loop).
+    Timeouts CURTOS e SEM retry: um Redis lento ou fora não pode segurar o scrape (o Prometheus
+    desiste em ~10 s e a API perderia TODAS as métricas, não só as do Redis). O retry com backoff
+    do redis-py, ótimo para o publisher, fazia um scrape com o Redis fora levar ~3,4 s (medido). A
+    próxima raspagem tenta de novo, então não há o que "persistir" aqui.
+    """
+    settings = settings or get_redis_settings()
+    return SyncRedis(
+        host=settings.host,
+        port=settings.port,
+        db=settings.db,
+        decode_responses=True,
+        socket_connect_timeout=1,
+        socket_timeout=2,
+        retry=Retry(NoBackoff(), 0),
     )

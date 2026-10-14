@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import enum
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -77,6 +77,7 @@ class ReplayEngine:
         speed: float = 1.0,
         lookahead_s: float = DEFAULT_LOOKAHEAD_S,
         max_batch: int = MAX_BATCH,
+        on_published: Callable[[int], None] | None = None,
     ) -> None:
         self._source = source
         self._publisher = publisher
@@ -84,6 +85,9 @@ class ReplayEngine:
         self._tolerance_s = max(lookahead_s, _MIN_TOLERANCE_S)
         self._max_batch = max_batch
         self._initial_speed = validate_speed(speed)
+        # Chamado com o tamanho de cada lote publicado. É por onde as métricas (processo da API)
+        # contam eventos sem este pacote conhecer o Prometheus.
+        self._on_published = on_published
 
         self._timeline: Timeline | None = None
         self._state = ReplayState.PENDING
@@ -231,6 +235,8 @@ class ReplayEngine:
             return
         await self._publisher.publish_many(batch)
         self._published += len(batch)
+        if self._on_published is not None:
+            self._on_published(len(batch))
         for event in batch:
             if isinstance(event, RaceStatusEvent):
                 self._lap, self._total_laps = event.lap, event.total_laps

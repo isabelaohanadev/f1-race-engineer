@@ -29,11 +29,12 @@ import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from replay.events import MalformedEvent, entry_to_json, parse_entry, stream_key
+from replay.events import MalformedEvent, entry_to_json, id_ms, parse_entry, stream_key
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +49,26 @@ class HubStats:
     dropped_slow: int = 0  # clientes desconectados por não acompanhar
 
 
+class Delivery(NamedTuple):
+    """O que vai na fila de um cliente: a mensagem JSON e QUANDO o evento foi publicado (ms Unix,
+    a parte de tempo do ID do stream). O segundo serve para medir a latência publicação->entrega
+    quando o envio termina; `None` = não medir (ex.: mensagens que não são eventos ao vivo)."""
+
+    payload: str
+    published_ms: int | None
+
+
 class Subscription:
     """A fila de UM cliente, mais o ponto do stream a partir do qual ela recebe (`join_id`)."""
 
     def __init__(self, maxsize: int, join_id: str) -> None:
-        self.queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize)
+        self.queue: asyncio.Queue[Delivery | None] = asyncio.Queue(maxsize)
         self.join_id = join_id  # tudo o que vem DEPOIS deste ID entra na fila
         self.overflowed = False
 
-    def offer(self, payload: str) -> bool:
+    def offer(self, payload: str, published_ms: int | None = None) -> bool:
         try:
-            self.queue.put_nowait(payload)
+            self.queue.put_nowait(Delivery(payload, published_ms))
         except asyncio.QueueFull:
             return False
         return True
@@ -139,8 +149,9 @@ class RaceHub:
                 logger.warning("Entrada ilegível ignorada: %s %s", entry_id, fields)
                 continue
             self.stats.dispatched += 1
+            published_ms = id_ms(entry_id)
             for sub in list(self._subs):  # ...e entrega a mesma string a todos
-                if not sub.offer(payload):
+                if not sub.offer(payload, published_ms):
                     self._subs.discard(sub)  # fila cheia: este cliente não acompanha
                     sub.close(overflowed=True)
                     self.stats.dropped_slow += 1
@@ -202,7 +213,9 @@ class HubRegistry:
 
     @property
     def clients(self) -> int:
-        return sum(hub.clients for hub in self._hubs.values())
+        # list(): o /metrics lê isto de OUTRA thread enquanto o event loop abre/fecha hubs; iterar o
+        # dict direto poderia levantar "dictionary changed size during iteration".
+        return sum(hub.clients for hub in list(self._hubs.values()))
 
     def _remove(self, hub: RaceHub) -> None:
         if self._hubs.get((hub.year, hub.round_number)) is hub:

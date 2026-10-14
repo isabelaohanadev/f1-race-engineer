@@ -10,3 +10,5 @@ psycopg[binary]>=3.2,<4.0
 fastf1>=3.4,<4.0
 # Cliente Redis; o submódulo redis.asyncio (async/await) já vem no pacote, sem extra.
 redis>=8.1,<9.0
+# Métricas Prometheus (/metrics na API e no worker).
+prometheus-client>=0.20,<1.0

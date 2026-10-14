@@ -18,9 +18,11 @@ def entry(n: int, driver: str = "VER") -> tuple[str, dict[str, str]]:
 
 
 def drain(queue: asyncio.Queue) -> list:
+    """Esvazia a fila e devolve só as MENSAGENS (o `payload` de cada Delivery)."""
     items = []
     while not queue.empty():
-        items.append(queue.get_nowait())
+        item = queue.get_nowait()
+        items.append(item.payload if item is not None else None)
     return items
 
 
@@ -49,7 +51,7 @@ async def test_each_event_is_serialized_once_and_shared_by_all_clients(hub: Race
     hub.dispatch([entry(1)])
 
     # A MESMA string nas duas filas: serializar uma vez e entregar N vezes (não N serializações).
-    assert one.queue.get_nowait() is two.queue.get_nowait()
+    assert one.queue.get_nowait().payload is two.queue.get_nowait().payload
 
 
 async def test_events_carry_real_types_the_stream_id_and_the_epoch(hub: RaceHub):
@@ -59,7 +61,7 @@ async def test_events_carry_real_types_the_stream_id_and_the_epoch(hub: RaceHub)
 
     import json
 
-    assert json.loads(sub.queue.get_nowait()) == {
+    assert json.loads(sub.queue.get_nowait().payload) == {
         "type": "position",
         "id": "7-0",
         "epoch": 1,
@@ -68,6 +70,16 @@ async def test_events_carry_real_types_the_stream_id_and_the_epoch(hub: RaceHub)
         "y": -7,
         "t": 7,
     }
+
+
+async def test_each_delivery_carries_the_publication_instant_from_the_stream_id(hub: RaceHub):
+    """O ID do stream (`ms-seq`) é o instante em que o Redis registrou a entrada: é dele que sai a
+    latência publicação->entrega, sem gravar relógio nenhum no evento."""
+    sub = await hub.subscribe()
+
+    hub.dispatch([("1730649000123-4", PositionEvent("VER", 1, 2, 3).to_fields() | {"epoch": "1"})])
+
+    assert sub.queue.get_nowait().published_ms == 1_730_649_000_123
 
 
 async def test_a_client_only_receives_events_after_the_point_it_joined(hub: RaceHub):

@@ -2,9 +2,11 @@
 Um WebSocket falso permite TRAVAR o envio de propósito."""
 
 import asyncio
+import time
 
 import pytest
 
+from app import metrics
 from app.hub import Subscription
 from app.routers.ws import SlowClient, pump, snapshot_json
 from replay.state import RaceSnapshot
@@ -121,3 +123,42 @@ def test_the_snapshot_frame_has_a_stable_shape():
         "classification": ["VER"],
         "replay": {"state": "running"},
     }
+
+
+def _latency_observations() -> tuple[float, float]:
+    count = metrics.REGISTRY.get_sample_value("f1_delivery_latency_seconds_count") or 0.0
+    total = metrics.REGISTRY.get_sample_value("f1_delivery_latency_seconds_sum") or 0.0
+    return count, total
+
+
+async def test_the_delivery_latency_is_observed_when_the_send_finishes():
+    ws, sub = FakeWebSocket(), Subscription(100, "0-0")
+    published_ms = int(time.time() * 1000) - 50  # o evento foi publicado há ~50 ms
+    sub.offer("ao-vivo", published_ms)
+    count_before, sum_before = _latency_observations()
+    task = asyncio.create_task(pump(ws, sub))
+
+    for _ in range(20):
+        await asyncio.sleep(0)
+    ws.disconnect()
+    await asyncio.wait_for(task, 1)
+
+    count_after, sum_after = _latency_observations()
+    assert count_after - count_before == 1
+    assert 0.049 <= sum_after - sum_before < 0.5  # ~50 ms (mais o que o envio levou)
+
+
+async def test_messages_without_a_publication_instant_are_not_measured():
+    """Mensagens que não são eventos ao vivo (published_ms=None) não podem sujar o histograma."""
+    ws, sub = FakeWebSocket(), Subscription(100, "0-0")
+    sub.offer("sem-instante")  # published_ms=None
+    count_before, _ = _latency_observations()
+    task = asyncio.create_task(pump(ws, sub))
+
+    for _ in range(20):
+        await asyncio.sleep(0)
+    ws.disconnect()
+    await asyncio.wait_for(task, 1)
+
+    assert ws.sent == ["sem-instante"]
+    assert _latency_observations()[0] == count_before

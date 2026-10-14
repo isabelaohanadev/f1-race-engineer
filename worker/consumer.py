@@ -37,8 +37,10 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
 
 from app.redis_client import MAX_BLOCK_MS
-from replay.events import MalformedEvent, parse_entry
+from replay.events import MalformedEvent, id_ms, parse_entry
+from replay.latency import seconds_since
 from replay.state import STREAMS_REGISTRY_KEY, WORKER_GROUP, RaceStateStore
+from worker import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -114,13 +116,18 @@ class StateWorker:
 
     # ------------------------------------------------------------ processamento
 
-    async def _process(self, stream: str, messages: list[tuple[str, dict[str, str]]]) -> None:
+    async def _process(
+        self, stream: str, messages: list[tuple[str, dict[str, str]]], *, claimed: bool = False
+    ) -> None:
         """Aplica um lote num único ida-e-volta (pipeline) e confirma. A confirmação vem NO FIM:
         se a conexão cair no meio, as entradas ficam pendentes e serão reentregues."""
         if not messages:
             return
         year, round_number = self._races[stream]
         ack_ids: list[str] = []
+        applied_ids: list[
+            str
+        ] = []  # as que entraram no pipeline (para medir a latência de cada uma)
         queued = 0
         async with self._redis.pipeline(transaction=False) as pipe:
             for entry_id, fields in messages:
@@ -131,8 +138,10 @@ class StateWorker:
                     # Sem confirmar, ela voltaria a cada XAUTOCLAIM para sempre (mensagem "veneno").
                     logger.warning("Entrada ilegível descartada: %s %s", entry_id, fields)
                     self.stats.malformed += 1
+                    metrics.EVENTS.labels("malformed").inc()
                     continue
                 await self._store.queue_apply(pipe, year, round_number, entry)
+                applied_ids.append(entry_id)
                 queued += 1
             pipe.xack(stream, WORKER_GROUP, *ack_ids)
             results = await pipe.execute()
@@ -140,6 +149,12 @@ class StateWorker:
         self.stats.batches += 1
         self.stats.applied += applied
         self.stats.ignored += queued - applied
+        metrics.BATCHES.inc()
+        metrics.EVENTS.labels("applied").inc(applied)
+        metrics.EVENTS.labels("ignored").inc(queued - applied)
+        if not claimed:  # o resgatado esperou, por definição, muito: não mede a "frescura" normal
+            for entry_id in applied_ids:
+                metrics.APPLY_LATENCY.observe(seconds_since(id_ms(entry_id)))
 
     async def _claim_abandoned(self) -> None:
         for stream in list(self._races):
@@ -161,7 +176,8 @@ class StateWorker:
                 if messages:
                     logger.info("Resgatadas %d entradas pendentes de %s", len(messages), stream)
                     self.stats.claimed += len(messages)
-                    await self._process(stream, messages)
+                    metrics.CLAIMED.inc(len(messages))
+                    await self._process(stream, messages, claimed=True)
                 if cursor == "0-0":  # varreu o PEL inteiro
                     break
 
