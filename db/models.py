@@ -139,7 +139,8 @@ class Lap(Base):
 
 
 class PositionSample(Base):
-    """Amostra de posição (x, y) de um carro. É a tabela grande: ~650 mil linhas por corrida.
+    """Amostra de posição (x, y) de um carro. É a tabela grande: ~800 mil linhas por corrida
+    (medido no GP do Brasil 2024: 797.642 linhas, ~75 MB com índices).
 
     Vira uma HYPERTABLE do TimescaleDB na migration (particionada por `time`).
     """
@@ -166,7 +167,7 @@ class PositionSample(Base):
         # ÍNDICE 1 (PK: race_id, driver_id, time): trajetória de UM piloto numa janela de tempo
         # ("onde estava o VER entre 14:10 e 14:12?") e alvo do ON CONFLICT da ingestão.
         # ÍNDICE 2 abaixo: leitura da corrida INTEIRA em ordem de tempo (usado pelo replay).
-        # Sem ele, ordenar ~650 mil linhas de todos os pilotos por `time` exigiria um sort enorme.
+        # Sem ele, ordenar ~800 mil linhas de todos os pilotos por `time` exigiria um sort enorme.
         # Desativamos o índice automático só em `time` (create_default_indexes=false na migration):
         # nenhuma consulta nossa filtra por tempo sem filtrar a corrida, então ele só custaria
         # escrita. Cada índice a mais deixa o INSERT em lote mais lento.

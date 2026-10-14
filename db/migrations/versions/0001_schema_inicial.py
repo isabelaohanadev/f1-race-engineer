@@ -125,7 +125,7 @@ def upgrade() -> None:
     #  * ciclo de vida: apagar/comprimir telemetria antiga vira operação por chunk (instantânea),
     #    em vez de DELETE linha a linha seguido de VACUUM.
     # chunk de 7 dias: o calendário da F1 tem no máximo ~1 corrida por semana, então cada corrida
-    # cai em (quase sempre) um único chunk de ~650 mil linhas, um tamanho confortável.
+    # cai em (quase sempre) um único chunk de ~800 mil linhas (~75 MB), um tamanho confortável.
     # create_default_indexes => FALSE: o índice automático só em `time` não atende nenhuma consulta
     # nossa (todas filtram por corrida) e só encareceria a escrita; criamos o índice certo abaixo.
     # Usamos a API by_range (a assinatura antiga com time_column_name está deprecated desde 2.13).
