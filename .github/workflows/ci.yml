@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Um push novo no mesmo branch/PR cancela a execução anterior ainda em andamento (economiza minutos
+# e evita resultado velho competindo com o novo).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Princípio do menor privilégio: o CI só precisa LER o repositório.
+permissions:
+  contents: read
+
+jobs:
+  # Lint primeiro e sozinho: leva segundos e pega o erro mais barato (estilo/imports/bugs óbvios)
+  # ANTES de gastar minutos subindo banco e instalando pandas/scipy para os testes.
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lint.txt
+      - run: pip install -r requirements-lint.txt
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: Testes (unitários + integração com TimescaleDB)
+    needs: lint # só roda se o lint passou
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # TimescaleDB real como service container: o MESMO que o docker-compose.yml usa. Mantenha a
+    # versão da imagem em sincronia com o compose.
+    services:
+      db:
+        image: timescale/timescaledb:2.30.2-pg16
+        env:
+          POSTGRES_USER: f1
+          POSTGRES_PASSWORD: ci_password # descartável: o banco só existe durante este job
+          POSTGRES_DB: f1_race_engineer
+        ports:
+          - 5432:5432
+        # O job só começa quando o banco está saudável. `-h 127.0.0.1` força TCP: no 1º boot a
+        # imagem sobe um servidor temporário só em socket Unix, e sem isso o pg_isready aprovaria
+        # cedo demais (mesma pegadinha do healthcheck do docker-compose.yml).
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U f1 -d f1_race_engineer"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: f1
+      POSTGRES_PASSWORD: ci_password
+      POSTGRES_DB: f1_race_engineer
+      # Os testes de integração NUNCA podem ser pulados em silêncio no CI: com esta variável, "banco
+      # inacessível" ou "senha ausente" vira FALHA em vez de skip (ver tests/integration/conftest.py).
+      REQUIRE_INTEGRATION_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12" # mesma versão da imagem Docker (python:3.12-slim)
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+
+      # Separados para o log mostrar qual camada quebrou: rápidos e sem banco primeiro.
+      - name: Testes unitários (sem banco)
+        run: pytest -m "not integration"
+      - name: Testes de integração (TimescaleDB real)
+        # -ra lista o motivo de qualquer skip/xfail no resumo. Se nenhum teste for coletado o
+        # pytest sai com código 5 e o passo falha (não passa "vazio").
+        run: pytest -m integration -ra

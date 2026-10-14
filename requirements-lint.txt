@@ -1,0 +1,5 @@
+# Só o linter. Existe separado de requirements-dev.txt para o job de lint do CI instalar em
+# segundos (sem pandas/scipy/matplotlib do FastF1) e falhar rápido.
+# Versão fixada na série 0.17.x: o ruff pode mudar regras e formatação entre versões menores, e
+# CI e máquina local precisam concordar sobre o que é "código formatado".
+ruff~=0.17.0
