@@ -300,6 +300,14 @@ python -m strategy.quality                                         # tabelas no 
 python -m strategy.quality --markdown docs/qualidade-dos-dados.md  # e grava o relatório
 ```
 
+E o funil da limpeza, que mostra quantas voltas cada regra tira por corrida (só ficam as voltas com
+status exatamente `1`; a amarela aparece separada e corridas que perdem mais de 40% são sinalizadas),
+em `docs/limpeza-das-voltas.md`:
+
+```bash
+python -m strategy.cleaning --markdown docs/limpeza-das-voltas.md
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -648,7 +656,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): por ora a inspeção de qualidade das voltas
+strategy/       estratégia (Fase 3): qualidade e limpeza das voltas (cálculo puro, sem banco)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

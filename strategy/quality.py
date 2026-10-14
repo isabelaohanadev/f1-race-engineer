@@ -27,13 +27,14 @@ from statistics import median
 from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
-from db.models import Driver, Lap, PositionSample, Race, RaceEntry
+from db.models import Driver, PositionSample, RaceEntry
 from db.session import get_session_factory
+from strategy.laps import DRY_COMPOUNDS, LapRow, list_races, load_race_laps, race_label
+from strategy.tables import render_markdown, render_text
 
 # Códigos de status de pista do FastF1 (db/models.py: Lap.track_status).
 STATUS_YELLOW, STATUS_SC, STATUS_RED, STATUS_VSC, STATUS_VSC_ENDING = "2", "4", "5", "6", "7"
 STATUS_CODES = (STATUS_YELLOW, STATUS_SC, STATUS_RED, STATUS_VSC, STATUS_VSC_ENDING)
-DRY_COMPOUNDS = frozenset({"SOFT", "MEDIUM", "HARD"})
 
 # O tempo de volta e o relógio da sessão são medidos separadamente e arredondados para o ms: até
 # 2 ms de diferença é ruído de arredondamento, não inconsistência.
@@ -41,23 +42,6 @@ CLOCK_TOLERANCE_MS = 2
 # "Volta lenta": mais de 125% da mediana da corrida. Não é regra de exclusão (o modelo robusto de
 # ritmo lida com ela), é uma medida de quanta sujeira de tráfego/SC/erro há no dado.
 SLOW_FACTOR = 1.25
-
-
-@dataclass(frozen=True, slots=True)
-class LapRow:
-    """Uma volta, com só o que a inspeção lê (o mesmo que o modelo vai ler)."""
-
-    driver: str
-    lap_number: int
-    lap_time_ms: int | None
-    compound: str | None
-    tyre_life: int | None
-    stint: int | None
-    position: int | None
-    session_time_ms: int | None
-    pit_in: bool | None
-    pit_out: bool | None
-    track_status: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,48 +341,13 @@ def anomaly_table(qualities: Sequence[RaceQuality]) -> list[list[str]]:
     return rows
 
 
-def render_text(table: list[list[str]]) -> str:
-    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
-    lines = ["  ".join(cell.ljust(w) for cell, w in zip(row, widths, strict=True)) for row in table]
-    lines.insert(1, "  ".join("-" * w for w in widths))
-    return "\n".join(lines)
-
-
-def render_markdown(table: list[list[str]]) -> str:
-    head, *body = table
-    lines = ["| " + " | ".join(head) + " |", "|" + "|".join("---" for _ in head) + "|"]
-    lines += ["| " + " | ".join(row) + " |" for row in body]
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------- banco
 
 
 def load_qualities(session: Session, year: int | None = None) -> list[RaceQuality]:
-    races = session.execute(
-        select(Race.id, Race.year, Race.round, Race.name, Race.total_laps)
-        .where(Race.year == year if year is not None else Race.id.is_not(None))
-        .order_by(Race.year, Race.round)
-    ).all()
     qualities = []
-    for race in races:
-        lap_rows = session.execute(
-            select(
-                Driver.code,
-                Lap.lap_number,
-                Lap.lap_time_ms,
-                Lap.compound,
-                Lap.tyre_life,
-                Lap.stint,
-                Lap.position,
-                Lap.session_time_ms,
-                Lap.pit_in,
-                Lap.pit_out,
-                Lap.track_status,
-            )
-            .join(Driver, Driver.id == Lap.driver_id)
-            .where(Lap.race_id == race.id)
-        ).all()
+    for race in list_races(session, year):
+        lap_rows = load_race_laps(session, race.id)
         entries = session.execute(
             select(Driver.code, RaceEntry.finish_position, RaceEntry.status)
             .join(Driver, Driver.id == RaceEntry.driver_id)
@@ -411,8 +360,8 @@ def load_qualities(session: Session, year: int | None = None) -> list[RaceQualit
         )
         qualities.append(
             inspect_laps(
-                f"{race.year} R{race.round:02d} {race.name.removesuffix(' Grand Prix')}",
-                [LapRow(*row) for row in lap_rows],
+                race_label(race.year, race.round, race.name),
+                lap_rows,
                 entries=[EntryRow(*row) for row in entries],
                 total_laps=race.total_laps,
                 has_positions=has_positions,
