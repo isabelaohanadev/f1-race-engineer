@@ -14,6 +14,7 @@ class ErrorResponse(BaseModel):
 class HealthChecks(BaseModel):
     process: Literal["ok"]  # se o endpoint respondeu, o processo está vivo
     database: Literal["ok", "unavailable"]
+    redis: Literal["ok", "unavailable"]
 
 
 class HealthResponse(BaseModel):

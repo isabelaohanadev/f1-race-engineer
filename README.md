@@ -159,7 +159,7 @@ uvicorn app.main:app --reload
 
 | Endpoint | Descrição | Respostas |
 |---|---|---|
-| `GET /health` | Separa **processo vivo** de **banco acessível** | `200` tudo ok · `503` banco inacessível |
+| `GET /health` | Separa **processo vivo**, **banco** e **Redis** | `200` (com `status: "degraded"` se só o Redis caiu) · `503` banco inacessível |
 | `GET /races/{year}/{round}/laps` | Voltas da corrida (tempo, composto, idade do pneu, stint, posição) | `200` · `404` corrida não ingerida · `422` parâmetro inválido |
 | `GET /races/{year}/{round}/laps?driver=VER` | Só as voltas de um piloto (código de 3 letras, sem diferenciar maiúsculas) | `200` · `404` piloto fora da corrida · `422` formato inválido |
 
@@ -170,8 +170,12 @@ Regras que valem a pena conhecer:
 - **Piloto que não largou** (DNS) é `200` com lista vazia: ele consta na corrida, só não tem voltas.
   Isso é diferente de um código que não participou (`404`).
 - **`/health` com banco fora do ar** responde `503` com o corpo
-  `{"status":"degraded","checks":{"process":"ok","database":"unavailable"}}`. O detalhe do erro
-  vai só para o log, nunca para a resposta.
+  `{"status":"degraded","checks":{"process":"ok","database":"unavailable","redis":"ok"}}`. O detalhe
+  do erro vai só para o log, nunca para a resposta.
+- **`/health` com só o Redis fora** continua `200`: o corpo traz `"redis":"unavailable"` e
+  `"status":"degraded"`, mas o código HTTP não muda. Só o streaming depende do Redis; as rotas REST
+  seguem funcionando, e tirar a instância do balanceador derrubaria o que ainda funciona. O PING
+  tem limite de 1 s para o healthcheck do Docker (3 s) nunca estourar por causa do Redis.
 
 Exemplo (`?driver=VER`, GP do Brasil 2024, trecho):
 
@@ -247,6 +251,7 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 app/            API FastAPI (config, deps, schemas, routers/)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
+replay/         motor de replay: fonte (keyset), timeline, engine, publisher, lock, manager
 tests/          unitários, ingestion/ (loader, CLI) e integration/ (Timescale real)
 .github/        workflow de CI
 docker-compose.yml · Dockerfile · .env.example

@@ -7,6 +7,7 @@ portáveis, então `create_all` funciona. O que NÃO é portável (ON CONFLICT d
 timestamptz) é coberto pelos testes de integração, contra o Timescale real (tests/integration).
 """
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -16,11 +17,40 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.deps import get_db
+from app.deps import get_db, get_redis
 from app.main import app
 from db.models import Base, Driver, Lap, Race, RaceEntry, Team
 
 T0 = datetime(2024, 11, 3, 15, 50, tzinfo=UTC)
+
+
+class StubRedis:
+    """Faz as vezes do Redis nos testes da API: só implementa o que o app chama (PING).
+
+    Configure `error` (a exceção que o PING levanta) ou `hang` (o PING nunca responde) para simular
+    um Redis com problemas. O Redis de verdade é exercitado em tests/integration.
+    """
+
+    def __init__(self) -> None:
+        self.error: Exception | None = None
+        self.hang = False
+
+    async def ping(self) -> bool:
+        if self.hang:
+            await asyncio.Event().wait()  # espera para sempre: quem chama é que precisa ter timeout
+        if self.error is not None:
+            raise self.error
+        return True
+
+
+@pytest.fixture(autouse=True)
+def redis_stub() -> Iterator[StubRedis]:
+    """Todo teste da API roda com um Redis falso e saudável (por padrão). Sem isso, o /health
+    tentaria conectar no Redis de verdade e cada teste esperaria o timeout."""
+    stub = StubRedis()
+    app.dependency_overrides[get_redis] = lambda: stub
+    yield stub
+    app.dependency_overrides.pop(get_redis, None)
 
 
 @pytest.fixture

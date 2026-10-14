@@ -197,4 +197,6 @@ def test_health_reports_database_ok_against_real_timescale(real_client: TestClie
     response = real_client.get("/health")
 
     assert response.status_code == 200
-    assert response.json()["checks"] == {"process": "ok", "database": "ok"}
+    # O Redis aqui é o stub saudável do conftest raiz: o /health contra o Redis REAL está em
+    # test_redis.py. Este teste é sobre o banco.
+    assert response.json()["checks"]["database"] == "ok"
