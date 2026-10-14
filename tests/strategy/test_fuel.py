@@ -371,15 +371,6 @@ def test_dry_clean_laps_drop_wet_compounds_and_dirty_laps():
     assert [r.lap_number for r in fuel.dry_clean_laps(rows)] == [5]
 
 
-def test_dry_race_share():
-    rows = [lap("A", n, 90, "MEDIUM", n, 1) for n in range(1, 8)] + [
-        lap("A", n, 90, "INTERMEDIATE", n, 2) for n in range(8, 11)
-    ]
-
-    assert fuel.dry_race_share(rows) == pytest.approx(0.7)
-    assert fuel.dry_race_share([]) == 0.0
-
-
 # ------------------------------------------------------------------ relatório e CLI
 
 
@@ -430,7 +421,8 @@ def test_load_reports_skips_races_that_are_not_dry(seeded: Engine):
     with sessionmaker(seeded)() as session:
         reports, skipped = fuel.load_reports(session, year=2024)
 
-    assert reports == [] and skipped == ["2024 R21 São Paulo"]
+    assert reports == []
+    assert skipped == ["2024 R21 São Paulo: pista molhada (0% seca)"]
 
 
 def test_main_without_dry_races_explains_how_to_ingest(monkeypatch, capsys):

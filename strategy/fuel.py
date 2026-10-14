@@ -56,7 +56,8 @@ import numpy as np
 
 from db.session import get_session_factory
 from strategy.cleaning import clean_laps
-from strategy.laps import DRY_COMPOUNDS, LapRow, list_races, load_race_laps, race_label
+from strategy.laps import DRY_COMPOUNDS, LapRow, load_race_laps
+from strategy.population import split_population
 from strategy.regression import fit_linear, one_hot
 from strategy.tables import pct, render_markdown, render_text
 
@@ -74,8 +75,6 @@ MAX_REL_SE = 0.5  # ... e com erro-padrão de no máximo metade do físico
 MIN_LAPS = 60  # abaixo disto o ajuste (piloto + composto + inclinações + volta) não se sustenta
 MIN_STINTS = 6
 MIN_DRIVERS = 4
-# Corrida "seca" para validar o modelo: a pista não pode secar durante os stints.
-MIN_DRY_RACE_SHARE = 0.99
 SENSITIVITY_MULTIPLIERS = (0.0, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 PROGRESS_FRACTIONS = (0.25, 0.5, 0.75)
 # Um composto com menos voltas que isto não tem inclinação que se leia (o ajuste devolve, é ruído).
@@ -291,11 +290,6 @@ class RaceFuelReport:
     chosen: dict[str, CompoundSlope]  # a degradação com o k que o critério escolheu
 
 
-def dry_race_share(rows: Sequence[LapRow]) -> float:
-    known = [lap for lap in rows if lap.compound is not None]
-    return sum(lap.compound in DRY_COMPOUNDS for lap in known) / len(known) if known else 0.0
-
-
 def analyze_race(label: str, rows: Sequence[LapRow], total_laps: int) -> RaceFuelReport:
     laps = dry_clean_laps(rows)
     physical = physical_coefficient(total_laps)
@@ -319,17 +313,12 @@ def analyze_race(label: str, rows: Sequence[LapRow], total_laps: int) -> RaceFue
 
 
 def load_reports(session, year: int | None = None) -> tuple[list[RaceFuelReport], list[str]]:
-    """Relatório das corridas secas e os rótulos das que ficaram de fora (molhada ou mista)."""
-    reports, skipped = [], []
-    for race in list_races(session, year):
-        rows = load_race_laps(session, race.id)
-        label = race_label(race.year, race.round, race.name)
-        total = race.total_laps or max((lap.lap_number for lap in rows), default=0)
-        if not rows or not total or dry_race_share(rows) < MIN_DRY_RACE_SHARE:
-            skipped.append(label)
-            continue
-        reports.append(analyze_race(label, rows, total))
-    return reports, skipped
+    """Relatório das corridas do backtest principal (secas) e, à parte, as que ficaram de fora."""
+    main, separate = split_population(session, year)
+    reports = [
+        analyze_race(r.label, load_race_laps(session, r.race_id), r.total_laps) for r in main
+    ]
+    return reports, [f"{r.label}: {r.reason}" for r in separate]
 
 
 # ---------------------------------------------------------------- relatório
@@ -455,8 +444,8 @@ def _summary(reports: Sequence[RaceFuelReport], skipped: Sequence[str]) -> list[
     ratios = [c.ratio for c in identified if c.ratio is not None]
     used = sum(c.source == "estimado" for c in full)
     lines = [
-        f"- {len(reports)} corridas secas analisadas (ficaram de fora, por pista molhada ou mista: "
-        f"{', '.join(skipped) if skipped else 'nenhuma'}).",
+        f"- {len(reports)} corridas secas analisadas (reportadas à parte, fora da nota principal: "
+        f"{'; '.join(skipped) if skipped else 'nenhuma'}).",
         f"- Físico: de {min(r.physical for r in reports):.3f} a "
         f"{max(r.physical for r in reports):.3f} s/volta, conforme o número de voltas.",
         f"- Com a corrida inteira, o coeficiente é identificável em {len(identified)} de "

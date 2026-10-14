@@ -4,7 +4,7 @@ Gerado por `python -m strategy.fuel --markdown docs/combustivel.md` em 2026-10-1
 
 ## Resumo
 
-- 21 corridas secas analisadas (ficaram de fora, por pista molhada ou mista: 2024 R09 Canadian, 2024 R12 British, 2024 R21 São Paulo).
+- 21 corridas secas analisadas (reportadas à parte, fora da nota principal: 2024 R09 Canadian: pista molhada (33% seca); 2024 R12 British: pista mista (76% seca); 2024 R21 São Paulo: pista molhada (0% seca)).
 - Físico: de 0.042 a 0.075 s/volta, conforme o número de voltas.
 - Com a corrida inteira, o coeficiente é identificável em 21 de 21 corridas; o critério escolhe o estimado em 20 e o físico em 1.
 - Razão estimado/físico entre as identificáveis: mediana 1.20, de 0.60 a 2.25.

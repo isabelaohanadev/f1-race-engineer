@@ -322,6 +322,12 @@ E a "verdade" do backtest (a ordem na pista) contra o resultado oficial, corrida
 python -m strategy.results --markdown docs/verdade-do-backtest.md
 ```
 
+E quais corridas entram no backtest principal e quais ficam à parte:
+
+```bash
+python -m strategy.population
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -581,6 +587,7 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. Com dados só até a volta N o estimador quase nunca se identifica cedo (com 25% da corrida entrou em 2 de 21 corridas), então o físico, que não depende dos dados, cobre o começo. |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
 | **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
+| **Backtest principal só com corridas secas; as demais à parte** | Em pista molhada, ou que seca durante a corrida, o tempo cai por causa da pista e o modelo "descobre" degradação negativa: medir o erro nelas mediria o clima. O principal usa as 21 corridas com 99% ou mais das voltas em pneu de seco. A **corrida britânica** (76% seca, pista secando) é a que mais tentaria entrar por engano e fica à parte, junto com o Canadá e o Brasil (molhadas). |
 
 #### O coeficiente de combustível: estimado x físico
 
@@ -663,10 +670,8 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 - **A degradação com o `k` físico ainda sai negativa em Arábia Saudita, Mônaco e Catar** (HARD e
   MEDIUM, de 180 a 750 voltas cada). Testei a hipótese óbvia, que as voltas de safety car envelhecem o
   pneu sem desgastá-lo: descontá-las da idade muda a degradação em no máximo 0,005 s/volta, então **não
-  é isso**. Em Arábia e Mônaco o `k` estimado é 1,76x e 2,25x o físico (a pista evolui), o que
-  explica a maior parte. O Catar fica sem explicação: o erro-padrão do `k` lá é o maior (0,021) e o
-  limite de voltas por jogo de pneus faz os stints começarem em voltas parecidas, o que enfraquece a
-  identificação.
+  é isso**. Em Arábia e Mônaco o `k` estimado é 1,76x e 2,25x o físico, o que acompanha a pista
+  evoluir. A causa no Catar **não foi identificada** (ver as limitações).
 - Fora isso a estrutura é limpa: 0 buracos de volta, 0 saltos na idade do pneu, 0 trocas de composto
   dentro do stint, 0 relógios que não crescem e 0 discordâncias entre tempo de volta e relógio da
   sessão ou entre posição e ordem de chegada (as checagens têm testes que plantam o defeito).
@@ -674,6 +679,12 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 ## Limitações conhecidas
 
 **Estratégia (Fase 3, até aqui):**
+
+- **Degradação negativa no Catar, sem causa conhecida.** Mesmo com o `k` escolhido, HARD e MEDIUM
+  saem com degradação negativa no GP do Catar (HARD -0,023 e MEDIUM -0,029 s por volta de idade com
+  o `k` físico). Descartei uma hipótese (voltas de safety car inflando a idade do pneu, ver acima) e
+  não tenho outra verificada. O que se sabe é só que o erro-padrão do `k` estimado lá é o maior das
+  21 corridas (0,021 s/volta): qualquer número de degradação do Catar deve ser lido com isso em mente.
 
 - **O coeficiente de combustível pode trocar de fonte no meio da corrida.** O estimado só entra quando
   se identifica (com dados até 50% da corrida, em 17 de 21 corridas); antes disso vale o físico. A
@@ -723,7 +734,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade, limpeza, regressão, combustível, resultado (puro)
+strategy/       estratégia (Fase 3): qualidade, limpeza, população, regressão, combustível (puro)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
