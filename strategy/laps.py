@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from db.models import Driver, Lap, Race
+from db.models import Driver, Lap, Race, RaceEntry
 
 DRY_COMPOUNDS = frozenset({"SOFT", "MEDIUM", "HARD"})
 
@@ -31,6 +31,26 @@ class LapRow:
     pit_in: bool | None
     pit_out: bool | None
     track_status: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EntryRow:
+    """O resultado OFICIAL de um piloto (race_entries): o que a FIA classificou, com penalidades e
+    desqualificações. Não é a ordem na pista (ver strategy/results.py)."""
+
+    driver: str
+    finish_position: int | None
+    status: str | None = None
+
+
+def load_race_entries(session: Session, race_id: int) -> list[EntryRow]:
+    rows = session.execute(
+        select(Driver.code, RaceEntry.finish_position, RaceEntry.status)
+        .join(Driver, Driver.id == RaceEntry.driver_id)
+        .where(RaceEntry.race_id == race_id)
+        .order_by(Driver.code)
+    ).all()
+    return [EntryRow(*row) for row in rows]
 
 
 def load_race_laps(session: Session, race_id: int) -> list[LapRow]:

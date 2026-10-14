@@ -27,9 +27,17 @@ from statistics import median
 from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
-from db.models import Driver, PositionSample, RaceEntry
+from db.models import PositionSample
 from db.session import get_session_factory
-from strategy.laps import DRY_COMPOUNDS, LapRow, list_races, load_race_laps, race_label
+from strategy.laps import (
+    DRY_COMPOUNDS,
+    EntryRow,
+    LapRow,
+    list_races,
+    load_race_entries,
+    load_race_laps,
+    race_label,
+)
 from strategy.tables import render_markdown, render_text
 
 # Códigos de status de pista do FastF1 (db/models.py: Lap.track_status).
@@ -42,15 +50,6 @@ CLOCK_TOLERANCE_MS = 2
 # "Volta lenta": mais de 125% da mediana da corrida. Não é regra de exclusão (o modelo robusto de
 # ritmo lida com ela), é uma medida de quanta sujeira de tráfego/SC/erro há no dado.
 SLOW_FACTOR = 1.25
-
-
-@dataclass(frozen=True, slots=True)
-class EntryRow:
-    """O resultado oficial de um piloto: é a "verdade" contra a qual o backtest mede a previsão."""
-
-    driver: str
-    finish_position: int | None
-    status: str | None = None
 
 
 @dataclass(slots=True)
@@ -348,11 +347,7 @@ def load_qualities(session: Session, year: int | None = None) -> list[RaceQualit
     qualities = []
     for race in list_races(session, year):
         lap_rows = load_race_laps(session, race.id)
-        entries = session.execute(
-            select(Driver.code, RaceEntry.finish_position, RaceEntry.status)
-            .join(Driver, Driver.id == RaceEntry.driver_id)
-            .where(RaceEntry.race_id == race.id)
-        ).all()
+        entries = load_race_entries(session, race.id)
         # EXISTS para na primeira linha: contar ~800 mil posições só para saber "tem ou não" seria
         # trabalho jogado fora.
         has_positions = bool(
@@ -362,7 +357,7 @@ def load_qualities(session: Session, year: int | None = None) -> list[RaceQualit
             inspect_laps(
                 race_label(race.year, race.round, race.name),
                 lap_rows,
-                entries=[EntryRow(*row) for row in entries],
+                entries=entries,
                 total_laps=race.total_laps,
                 has_positions=has_positions,
             )

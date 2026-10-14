@@ -315,6 +315,13 @@ E o coeficiente de combustível (físico x estimado) e a sensibilidade da degrad
 python -m strategy.fuel --markdown docs/combustivel.md
 ```
 
+E a "verdade" do backtest (a ordem na pista) contra o resultado oficial, corrida a corrida, em
+`docs/verdade-do-backtest.md`:
+
+```bash
+python -m strategy.results --markdown docs/verdade-do-backtest.md
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -573,6 +580,7 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **`k` estimado junto com a degradação, com intercepto por piloto (não por stint)** | Dentro de um stint `volta = idade + constante`: com intercepto por stint o `k` é absorvido pela inclinação da idade e só se identifica `degradação - k`. O que os separa é comparar stints que começam em voltas diferentes, nos vários pilotos da corrida. |
 | **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. Com dados só até a volta N o estimador quase nunca se identifica cedo (com 25% da corrida entrou em 2 de 21 corridas), então o físico, que não depende dos dados, cobre o começo. |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
+| **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
 
 #### O coeficiente de combustível: estimado x físico
 
@@ -649,8 +657,9 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   linhas. A causa (a API externa) é inferida do código e do comportamento; o aviso de erro dessas
   cargas não foi capturado. O sinal para detectar é `sem_status > 0` no inspetor.
 - **Resultado oficial não é ordem na pista.** No GP da Bélgica o Russell venceu na pista e foi
-  desqualificado depois: o oficial desloca os 20 pilotos em relação à última volta. O backtest
-  precisa dizer qual dos dois é a "verdade".
+  desqualificado depois: o oficial desloca os 20 pilotos em relação à última volta. Por isso o
+  backtest mede contra a **ordem na pista** e reporta o oficial ao lado (decisão registrada acima e
+  em `docs/verdade-do-backtest.md`).
 - **A degradação com o `k` físico ainda sai negativa em Arábia Saudita, Mônaco e Catar** (HARD e
   MEDIUM, de 180 a 750 voltas cada). Testei a hipótese óbvia, que as voltas de safety car envelhecem o
   pneu sem desgastá-lo: descontá-las da idade muda a degradação em no máximo 0,005 s/volta, então **não
@@ -714,7 +723,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade, limpeza, regressão e combustível (cálculo puro)
+strategy/       estratégia (Fase 3): qualidade, limpeza, regressão, combustível, resultado (puro)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
