@@ -27,7 +27,9 @@ from tests.replay.fakes import (
     FakeLockRegistry,
     FakePublisher,
     FakeState,
+    GatedControl,
     ManualClock,
+    TickSleep,
     settle,
 )
 
@@ -42,10 +44,15 @@ class World:
     """Um gerenciador ligado a dublês, com acesso a tudo que ele criou."""
 
     def __init__(
-        self, session_factory, registry: FakeLockRegistry | None = None, clock=None, sleep=None
+        self,
+        session_factory,
+        registry: FakeLockRegistry | None = None,
+        clock=None,
+        sleep=None,
+        control: FakeControl | None = None,
     ) -> None:
         self.clock = clock or FakeClock()
-        self.control = FakeControl()
+        self.control = control or FakeControl()
         self.registry = registry or FakeLockRegistry()
         self.publisher = FakePublisher(self.clock)
         self.shared = FakeState()
@@ -432,3 +439,58 @@ async def test_the_terminal_status_is_published_before_the_stop_is_answered(seed
     reply_at = log.index(("reply", stop))
     assert log[reply_at - 1] == ("status", "stopped")  # o terminal vem logo ANTES da resposta
     assert ("status", "running") not in log[reply_at:]  # e nada "ativo" sobrescreve depois
+
+
+# ---------------------------------------------------------------- o status nunca anda para trás
+#
+# Corrida que fazia `test_the_rest_endpoints_drive_a_replay_owned_by_another_process` falhar de vez
+# em quando (2 vezes em 14 execuções completas): `POST /pause` devolvia `paused` e o `GET` seguinte
+# lia `running`. Eram DUAS corridas, e cada teste abaixo reproduz uma com a ordem sob controle.
+
+
+async def test_the_status_is_published_before_a_command_is_answered(seed, session_factory):
+    """Corrida 1: a resposta saía ANTES do status. Quem recebe `paused` e consulta o status logo em
+    seguida (outra instância da API, via Redis) lia o status velho, porque a escrita do novo ainda
+    estava a caminho. O `stop` já publicava antes de responder; pause, resume e speed não.
+
+    O heartbeat fica mudo: se ele publicasse por conta própria, o teste passaria mesmo com a ordem
+    errada (a mesma armadilha do teste do `stop`)."""
+    seed(positions=[(VER, at(0), 0, 0), (VER, at(60_000), 1, 1)], total_laps=3)
+    world = World(session_factory, clock=ManualClock(), sleep=never_ticks)
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.RUNNING)
+
+    for name, arg in (("pause", None), ("speed", 16), ("resume", None)):
+        command = world.control.send(name, arg)
+        await settle(lambda command=command: command in world.control.replies)
+
+        answered = world.control.replies[command].info.status
+        published = world.control.status_at_reply[command]
+        assert (published.state, published.speed) == (answered.state, answered.speed), name
+
+    await world.manager.stop(*RACE)
+
+
+async def test_a_stale_heartbeat_write_cannot_land_on_top_of_a_newer_status(seed, session_factory):
+    """Corrida 2: o heartbeat LÊ o status (`running`) e a escrita demora; nesse intervalo o pause
+    executa e publica `paused`; a escrita velha chega depois e o Redis volta a dizer `running`
+    (até o heartbeat seguinte, ~1 s). A latência do Redis é simulada: a publicação do heartbeat
+    fica no ar até o teste soltá-la."""
+    seed(positions=[(VER, at(0), 0, 0), (VER, at(60_000), 1, 1)], total_laps=3)
+    control, tick = GatedControl(), TickSleep()
+    world = World(session_factory, clock=ManualClock(), sleep=tick, control=control)
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.RUNNING)
+
+    control.hold_next_publish()
+    tick.tick()  # o heartbeat lê "running"...
+    await settle(lambda: control.in_flight)  # ...e a escrita fica a caminho
+    pause = control.send("pause")
+    await settle(lambda: world.state() is ReplayState.PAUSED)  # o dono executou o pause
+    control.release()  # a escrita velha ("running") termina AGORA, depois do pause
+    await settle(lambda: pause in control.replies)
+    for _ in range(50):  # deixa qualquer publicação pendente terminar
+        await asyncio.sleep(0)
+
+    assert control.last_status.state is ReplayState.PAUSED
+    await world.manager.stop(*RACE)
