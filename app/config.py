@@ -36,3 +36,31 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Instância única (cacheada). Nos testes, use dependency_overrides ou limpe o cache."""
     return Settings()
+
+
+class RedisSettings(BaseSettings):
+    """Conexão com o Redis, em uma classe SEPARADA de `Settings` de propósito.
+
+    O worker consumidor (Fase 2) só fala com o Redis: não tem por que exigir (nem receber) a senha
+    do Postgres, e `Settings()` falha sem `POSTGRES_PASSWORD`. Separar dá menos privilégio para o
+    worker e deixa os testes do Redis independentes do banco. O prefixo REDIS_ vem de env_prefix:
+    `host` lê REDIS_HOST, `port` lê REDIS_PORT, e assim por diante.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_prefix="REDIS_")
+
+    host: str = "localhost"
+    port: int = 6379
+    # Índice do banco lógico (0-15). A aplicação usa o 0; os testes de integração usam outro
+    # (ver tests/integration/conftest.py) para nunca encostar nos dados de desenvolvimento.
+    db: int = 0
+
+    @property
+    def url(self) -> str:
+        # Sem senha de propósito: o Redis do Compose só publica a porta em 127.0.0.1 (ver lá).
+        return f"redis://{self.host}:{self.port}/{self.db}"
+
+
+@lru_cache
+def get_redis_settings() -> RedisSettings:
+    return RedisSettings()

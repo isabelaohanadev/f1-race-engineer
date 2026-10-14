@@ -147,8 +147,8 @@ Só o banco roda no Docker; Python roda na sua máquina.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-cp .env.example .env              # ajuste POSTGRES_PORT se tiver mapeado outra porta
-docker compose up -d db
+cp .env.example .env              # ajuste POSTGRES_PORT / REDIS_PORT se tiver mapeado outras portas
+docker compose up -d db redis
 
 alembic upgrade head
 python -m ingestion --year 2024 --round 21
@@ -192,13 +192,14 @@ Exemplo (`?driver=VER`, GP do Brasil 2024, trecho):
 
 ```bash
 pytest -m "not integration"       # unitários: poucos segundos, sem banco nem rede
-pytest                            # tudo; requer o banco (docker compose up -d db)
+pytest                            # tudo; requer banco e Redis (docker compose up -d db redis)
 ```
 
 - **Unitários:** SQLite em memória com dados semeados à mão, e DataFrames sintéticos com as
   mesmas colunas e tipos do FastF1 (incluindo os casos de borda: volta sem tempo, piloto sem
   composto de pneu, nulos nas posições). Nenhum teste baixa dados da F1.
-- **Integração** (marker `integration`): cada execução cria um **banco descartável** no
+- **Integração** (marker `integration`; Redis real no banco lógico 15, esvaziado a cada teste):
+  cada execução cria um **banco descartável** no
   TimescaleDB do Compose, roda a migration de verdade e o apaga no final, então seus dados de
   desenvolvimento nunca são tocados. Cobrem o que o SQLite não alcança: a hypertable, o
   `ON CONFLICT` do Postgres, a atomicidade da ingestão e a deriva entre models e migrations
@@ -208,8 +209,8 @@ pytest                            # tudo; requer o banco (docker compose up -d d
 
 Lint: `ruff check . && ruff format --check .`
 
-O CI (GitHub Actions) roda o lint primeiro, para falhar rápido, e só então os testes, com um
-TimescaleDB real como service container.
+O CI (GitHub Actions) roda o lint primeiro, para falhar rápido, e só então os testes, com
+TimescaleDB e Redis reais como service containers.
 
 ## Decisões de design
 

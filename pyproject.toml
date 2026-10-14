@@ -18,11 +18,16 @@ pythonpath = ["."]
 # --strict-markers: um marker digitado errado (ex.: "integraton") vira erro, em vez de um teste
 # que silenciosamente deixa de ser filtrado.
 addopts = "--strict-markers"
+# auto: todo `async def test_*` roda no event loop sem precisar de @pytest.mark.asyncio. Cada teste
+# (e cada fixture async) ganha um loop NOVO (scope "function"): o cliente Redis assíncrono fica
+# preso ao loop em que nasceu, então nada de loop compartilhado entre testes.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     # Aviso interno do pandas 2.3 com NumPy >= 2.5 ao parsear timedeltas; não é código nosso e
     # some quando o FastF1 permitir pandas 3. Filtro estreito de propósito: só esta mensagem.
     "ignore:The 'generic' unit for NumPy timedelta is deprecated:DeprecationWarning",
 ]
 markers = [
-    "integration: usa o TimescaleDB real do Compose (docker compose up -d db). Pule com -m 'not integration'",
+    "integration: usa TimescaleDB e Redis reais do Compose (docker compose up -d db redis). Pule com -m 'not integration'",
 ]

@@ -3,3 +3,4 @@
 -r requirements-lint.txt
 pytest>=8.0
 httpx>=0.27  # exigido pelo TestClient do FastAPI
+pytest-asyncio>=1.0  # testes `async def` (cliente Redis assíncrono)
