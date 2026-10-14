@@ -12,7 +12,8 @@ Brasil 2024 (e que explica várias linhas abaixo):
   transmitir e também no meio da corrida). Não são posições reais e teletransportariam o carro
   para a origem do mapa, então são descartadas.
 * NaN aparece em LapTime (voltas de largada/box), Position, Stint e TyreLife; e inteiros vêm como
-  float. Tudo é normalizado para int | None.
+  float. Tudo é normalizado para int | None. Nas posições, amostras com data ou coordenada nula
+  são descartadas (não há como gravá-las).
 """
 
 import logging
@@ -138,7 +139,11 @@ def _build_tracks(
             logger.warning("Posições do carro #%s ignoradas: não consta nos resultados", number)
             continue
 
-        # Descarta o placeholder (0, 0) = "sem sinal de GPS" (ver nota no topo do módulo).
+        # 1) Amostras inutilizáveis: sem instante (`time` é parte da PK e a ordenação perde o
+        #    sentido) ou com coordenada nula (int(NaN) levanta erro, e x/y são NOT NULL no banco).
+        #    Sem esta linha, UM valor nulo derrubava a ingestão da corrida inteira.
+        df = df.dropna(subset=["Date", "X", "Y"])
+        # 2) Placeholder (0, 0) = "sem sinal de GPS" (ver nota no topo do módulo).
         df = df[(df["X"] != 0) | (df["Y"] != 0)].sort_values("Date")
         # pandas 2.x: DatetimeIndex.to_pydatetime() devolve datetimes nativos (com UTC).
         times = pd.DatetimeIndex(df["Date"]).tz_localize("UTC").to_pydatetime().tolist()
