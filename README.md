@@ -584,7 +584,8 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Descartar voltas de box pela flag, não por "sem tempo"** | Nas corridas secas, 97% das voltas de entrada nos boxes têm tempo de volta (703 de 722). |
 | **Corrigir o combustível** | Pneu e combustível mexem no tempo com sinais contrários e do mesmo tamanho. Medido: sem correção, 25 das 53 linhas (corrida x composto, 30+ voltas) mostram degradação **negativa**; com o `k` físico são 7, e com o escolhido, 5. A mediana da degradação vai de +0,007 para +0,060 s por volta de idade. |
 | **`k` estimado junto com a degradação, com intercepto por piloto (não por stint)** | Dentro de um stint `volta = idade + constante`: com intercepto por stint o `k` é absorvido pela inclinação da idade e só se identifica `degradação - k`. O que os separa é comparar stints que começam em voltas diferentes, nos vários pilotos da corrida. |
-| **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. Com dados só até a volta N o estimador quase nunca se identifica cedo (com 25% da corrida entrou em 2 de 21 corridas), então o físico, que não depende dos dados, cobre o começo. |
+| **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. **Não foi apertado** depois: virou a variante `estimado` do backtest. |
+| **`k` com encolhimento contínuo, e as três variantes comparadas no backtest** | `k = w * estimado + (1 - w) * físico`, em vez de trocar de fonte num ponto da corrida (um degrau em `k` passa 1 para 1 para a degradação). `w = paradas_vistas/pilotos (no máximo 1) * precisão`; o estimado entra limitado a 0,5x..2x do físico e o erro-padrão é o maior entre o por cluster e o do jackknife por piloto. Só usa voltas até a volta N (testado corrompendo o futuro). `fisico`, `estimado` e `encolhimento` são variantes do backtest da etapa 8, e os números decidem o padrão. |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
 | **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
 | **Backtest principal só com corridas secas; as demais à parte** | Em pista molhada, ou que seca durante a corrida, o tempo cai por causa da pista e o modelo "descobre" degradação negativa: medir o erro nelas mediria o clima. O principal usa as 21 corridas com 99% ou mais das voltas em pneu de seco. A **corrida britânica** (76% seca, pista secando) é a que mais tentaria entrar por engano e fica à parte, junto com o Canadá e o Brasil (molhadas). |
@@ -608,6 +609,29 @@ de 0,042 a 0,075 s/volta). Em 21 corridas secas (`docs/combustivel.md`):
   compostos (confirmado nos dados, desvio máximo de 1e-11); a ordem entre compostos não muda. Com
   `k` a 0,5x a degradação mediana é +0,033 e a 1,5x é +0,085 (físico: +0,060): a escolha do
   coeficiente move a degradação tanto quanto a própria degradação.
+
+#### O encolhimento do `k`: o que errei no caminho
+
+Medido nas 21 corridas secas, em três tentativas (`docs/combustivel.md`, `strategy/fuel.py`):
+
+1. **Peso só por precisão (erro-padrão por cluster): ficou menos suave que a regra.** Maior passo
+   entre voltas, mediana 0,066 contra 0,024 s/volta, e 0,449 em Singapura. Cedo na corrida o
+   estimador devolve valores absurdos (até 19x o físico) **com erro-padrão pequeno**; qualquer peso
+   maior que zero deixa passar um estimador sem limite, e o portão de razão da regra binária protegia
+   disso sem que eu tivesse notado. Correção: estimado limitado a 0,5x..2x e erro-padrão por
+   jackknife (o quanto muda ao tirar um piloto).
+2. **Ainda tinha degrau.** Numa corrida sintética o `k` não existe na volta 15 e tem erro-padrão de
+   0,0008 na 16 (o primeiro piloto completou um segundo stint): a identificação chega de uma volta
+   para outra e o peso por precisão vai de 0 a 1 junto. Continuidade em `(estimado, erro-padrão)` não
+   basta quando as entradas pulam. Correção: ponderar também pelas **paradas já vistas**
+   (`min(1, paradas / pilotos)`), que crescem de uma em uma e nunca diminuem.
+3. **O gerador sintético não tinha voltas de box**, então a contagem de paradas dava zero e o teste
+   passava no vazio. Passou a emitir as voltas de entrada e saída, como os dados reais.
+
+Resultado final: o maior passo entre voltas consecutivas é menor que o da regra em **18 de 21
+corridas** (mediana 0,010 contra 0,024 s/volta, máximo 0,035 contra 0,051), empata em 2 e é pior em 1
+(Mônaco). O `k` ao fim da corrida é praticamente o da regra, exceto onde o estimado diverge (Mônaco:
+1,98x contra 1,00x do físico) e onde a identificação é fraca (Catar).
 
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
@@ -686,11 +710,16 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   não tenho outra verificada. O que se sabe é só que o erro-padrão do `k` estimado lá é o maior das
   21 corridas (0,021 s/volta): qualquer número de degradação do Catar deve ser lido com isso em mente.
 
-- **O coeficiente de combustível pode trocar de fonte no meio da corrida.** O estimado só entra quando
-  se identifica (com dados até 50% da corrida, em 17 de 21 corridas); antes disso vale o físico. A
-  troca muda o `k` de um valor para outro (na Arábia Saudita, de 0,066 para ~0,12 s/volta) e, como
-  `k` passa 1 para 1 para a degradação, a estimativa de degradação dá um salto. O backtest vai medir
-  quantas trocas ocorrem e o que custam; não há suavização.
+- **O `k` estimado ainda oscila a cada volta que chega.** O encolhimento contínuo tira o degrau da
+  troca de fonte (físico para estimado), mas não torna o `k` constante: o maior passo entre voltas
+  consecutivas cai de mediana 0,024 para 0,010 s/volta, e como `k` passa 1 para 1 para a degradação,
+  o que sobra de oscilação também passa. Em Mônaco o encolhimento é **pior** (0,035 contra 0,000):
+  a regra nunca saiu do físico (o estimado divergiu 2,25x) e o encolhimento caminha até o teto de 2x.
+  O peso do estimado sobe em tendência, não volta a volta (caiu de uma volta para a seguinte em 7% das
+  voltas).
+- **No primeiro quarto da corrida o `k` é praticamente o físico.** O peso mediano do estimado é 0,01
+  com dados até 25% da corrida, 0,74 até 50% e 0,98 até 75%: antes das primeiras paradas não há dado
+  que identifique o `k`, e o físico (a suposição de 0,03 s/kg) é o que vale.
 - **0,03 s/kg não foi validado de forma independente.** É uma suposição de engenharia; os dados só
   dizem que o `k` total (combustível + pista) é parecido com ele em 20 de 21 corridas, o que não
   prova que o combustível sozinho vale isso.

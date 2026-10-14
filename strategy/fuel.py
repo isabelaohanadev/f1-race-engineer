@@ -40,6 +40,42 @@ Só se for identificável, PRECISO (erro-padrão <= metade do físico: uma estim
 próprio efeito não informa nada) e PARECIDO com o físico (razão entre 0,5 e 2). Em qualquer outro
 caso, usa o físico e diz por quê. Com dados só até a volta N (sem vazamento do futuro) o estimador
 muitas vezes ainda não se identifica: então usa o físico, que não depende dos dados.
+
+ENCOLHIMENTO CONTÍNUO (a troca de fonte sem salto)
+A regra acima TROCA de físico para estimado num ponto da corrida, e a troca é um degrau em `k` que
+passa 1 para 1 para a degradação. O encolhimento a substitui por uma média ponderada:
+`k = w * estimado + (1 - w) * físico`, com `w` entre 0 e 1 crescendo com a quantidade de dados
+(voltas até N). `w` é o peso de precisão da média normal-normal, `w = t^2 / (t^2 + se^2)`, em
+que `t` é o quanto se aceita que o `k` real da corrida se afaste do físico (a priori, 50% dele)
+e `se` é o erro-padrão do estimado. Sem estimativa (não identificável), `se` é infinito e
+`w = 0`: é o físico, e a função é contínua nesse ponto (não há "ligar"; o `w` sobe de 0
+conforme os dados chegam).
+
+TRÊS COISAS QUE A PRIMEIRA VERSÃO ERROU (medido nas 21 corridas secas; o critério acima não mudou)
+1. Com o erro-padrão por cluster, o encolhimento ficou MENOS suave que a regra binária (maior
+   passo entre voltas de 0,066 s/volta, em mediana, contra 0,024; 0,449 em Singapura). Cedo na
+   corrida o estimador devolve valores absurdos (até 19x o físico) com erro-padrão pequeno, e
+   qualquer `w > 0` deixa passar um estimador sem limite: o portão de razão (0,5x a 2x) da regra
+   binária protegia disso sem que eu tivesse notado. Agora o estimado entra LIMITADO a esse mesmo
+   intervalo (um teto contínuo de influência, não uma chave liga-desliga) e o `se` é o MAIOR entre
+   o erro-padrão por cluster e o do jackknife por piloto (o quanto o estimado muda quando se tira
+   um piloto por vez): uma estimativa que depende de 2 pilotos tem jackknife grande e peso quase
+   nulo, mesmo com o erro-padrão clássico pequeno.
+2. Mesmo assim o encolhimento por precisão herdava o degrau: a identificação pode chegar de uma
+   volta para outra (numa corrida sintética, o `k` não existe na volta 15 e tem erro-padrão de
+   0,0008 na 16, quando o primeiro piloto completa um segundo stint), e `w` por precisão vai de 0
+   a 1 junto.
+   Continuidade em `(estimado, erro-padrão)` não basta se as entradas pulam. O que cresce de forma
+   gradual são as PARADAS já vistas (cada uma é uma comparação de stints): `w = dados * precisão`,
+   com `dados = min(1, paradas / pilotos)`. Nasce perto de 0 e só chega a 1 quando, em média, cada
+   piloto já parou uma vez; é monótono em N por construção.
+3. `w` como um todo cresce com os dados em tendência, mas NÃO é monótono volta a volta (a precisão
+   oscila). Não finjo o contrário: a tendência é testada e a fração de voltas em que `w` cai é
+   reportada.
+
+TRÊS VARIANTES PARA O BACKTEST: `fisico` (sempre o físico), `estimado` (a regra binária) e
+`encolhimento`. Os números do backtest (etapa 8) decidem qual vira o padrão; nenhuma é "a certa" por
+construção, e o critério da regra binária não é apertado aqui.
 """
 
 import argparse
@@ -48,6 +84,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from statistics import median
 from typing import Literal
@@ -75,6 +112,10 @@ MAX_REL_SE = 0.5  # ... e com erro-padrão de no máximo metade do físico
 MIN_LAPS = 60  # abaixo disto o ajuste (piloto + composto + inclinações + volta) não se sustenta
 MIN_STINTS = 6
 MIN_DRIVERS = 4
+# Encolhimento contínuo: o quanto se aceita (1 desvio, a priori) que o k real se afaste do físico.
+PRIOR_REL_SD = 0.5
+MIN_JACKKNIFE = 4  # com menos leave-one-out identificáveis, o jackknife não diz nada: peso 0
+FIRST_SERIES_LAP = 8  # a série volta a volta começa aqui (antes disso não há o que estimar)
 SENSITIVITY_MULTIPLIERS = (0.0, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 PROGRESS_FRACTIONS = (0.25, 0.5, 0.75)
 # Um composto com menos voltas que isto não tem inclinação que se leia (o ajuste devolve, é ruído).
@@ -196,6 +237,146 @@ def choose_fuel_coefficient(estimate: FuelEstimate, physical: float) -> FuelChoi
     return FuelChoice(estimate.kappa, "estimado", physical, estimate, "parecido e preciso")
 
 
+# ---------------------------------------------------------------- encolhimento contínuo
+
+
+class FuelVariant(StrEnum):
+    """As três formas de obter `k` que o backtest compara (etapa 8)."""
+
+    FISICO = "fisico"
+    ESTIMADO = "estimado"  # a regra binária: estimado se identificável, preciso e parecido
+    ENCOLHIMENTO = "encolhimento"
+
+
+def jackknife_se(laps: Sequence[LapRow]) -> float | None:
+    """Erro-padrão do `k` estimado pelo jackknife por piloto: refaz a estimativa tirando UM piloto
+    por vez e mede o quanto ela muda, `sqrt((g-1)/g * soma((k_i - media)^2))`. Diferente do
+    erro-padrão por cluster, que com poucos stints cedo na corrida sai pequeno demais, o jackknife
+    explode quando a estimativa depende de poucos pilotos. None se menos de MIN_JACKKNIFE
+    retiradas se identificam."""
+    estimates = []
+    for driver in sorted({lap.driver for lap in laps}):
+        estimate = estimate_fuel_coefficient([lap for lap in laps if lap.driver != driver])
+        if estimate.identified and estimate.kappa is not None:
+            estimates.append(estimate.kappa)
+    if len(estimates) < MIN_JACKKNIFE:
+        return None
+    values = np.array(estimates)
+    g = len(values)
+    return float(np.sqrt((g - 1) / g * np.sum((values - values.mean()) ** 2)))
+
+
+def pit_stops_seen(rows: Sequence[LapRow]) -> int:
+    """Paradas nos boxes já vistas: voltas de saída (a largada pelos boxes, na volta 1, não conta).
+    Cada parada é uma comparação de stints, e é ela que identifica o `k`: é a QUANTIDADE DE DADOS
+    que cresce de forma gradual, uma parada de cada vez, e nunca diminui com mais voltas."""
+    return sum(1 for row in rows if row.pit_out and row.lap_number > 1)
+
+
+def data_weight(rows: Sequence[LapRow]) -> float:
+    """De 0 a 1 conforme as paradas já vistas: peso cheio quando, em média, cada piloto já parou uma
+    vez. Cresce monotonamente com os dados até a volta N."""
+    drivers = len({row.driver for row in rows})
+    return min(1.0, pit_stops_seen(rows) / drivers) if drivers else 0.0
+
+
+def shrink_coefficient(
+    kappa_hat: float | None, se: float | None, physical: float, *, data: float = 1.0
+) -> tuple[float, float]:
+    """`(k, w)` com `k = w * estimado_limitado + (1 - w) * físico` e `w = data * precisão`.
+
+    * `precisão = t^2 / (t^2 + se^2)`: o quanto se confia no estimado, dado o seu erro-padrão.
+    * `data` (0 a 1, ver `data_weight`): a quantidade de dados. É ela que impede o degrau: a
+      identificação pode chegar de uma volta para outra (o estimador passa de inexistente a preciso
+      numa volta só), e o peso por precisão iria de 0 a 1 junto; ponderado pelas paradas já vistas,
+      `w` só sobe conforme elas chegam.
+
+    Função PURA e CONTÍNUA em `(kappa_hat, se, data)`: sem estimativa ou com `se` enorme, `w` tende
+    a 0 e `k` ao físico. O estimado é limitado a 1/MAX_RATIO..MAX_RATIO do físico (o mesmo intervalo
+    do critério), o que também é contínuo: nenhum valor, por absurdo que seja, move `k` para além
+    desse intervalo."""
+    if kappa_hat is None or se is None or not np.isfinite(se):
+        return physical, 0.0
+    prior_var = (PRIOR_REL_SD * physical) ** 2
+    weight = data * prior_var / (prior_var + se**2)
+    bounded = min(max(kappa_hat, physical / MAX_RATIO), physical * MAX_RATIO)
+    return weight * bounded + (1 - weight) * physical, weight
+
+
+@dataclass(frozen=True, slots=True)
+class FuelCoefficient:
+    kappa: float
+    variant: FuelVariant
+    physical: float
+    estimate: FuelEstimate
+    weight: float  # peso do estimado: 0 = só o físico, 1 = só o estimado (limitado)
+    reason: str
+
+
+def fuel_coefficient(
+    rows: Sequence[LapRow], *, upto_lap: int, total_laps: int, variant: FuelVariant
+) -> FuelCoefficient:
+    """O `k` a usar na volta `upto_lap`, só com o que se sabe até ela.
+
+    SEM VAZAMENTO DO FUTURO por construção: o primeiro passo é cortar as voltas depois de
+    `upto_lap`, antes de limpar, estimar ou pesar qualquer coisa. Receber a corrida inteira e
+    confiar que o chamador cortou seria a porta para o vazamento."""
+    laps = dry_clean_laps(laps_until(rows, upto_lap))
+    physical = physical_coefficient(total_laps)
+    if variant is FuelVariant.FISICO:
+        unused = FuelEstimate(None, None, len(laps), 0, 0, "variante física: não se estima")
+        return FuelCoefficient(physical, variant, physical, unused, 0.0, "físico por definição")
+
+    estimate = estimate_fuel_coefficient(laps)
+    if variant is FuelVariant.ESTIMADO:
+        choice = choose_fuel_coefficient(estimate, physical)
+        weight = 1.0 if choice.source == "estimado" else 0.0
+        return FuelCoefficient(choice.kappa, variant, physical, estimate, weight, choice.reason)
+
+    if not estimate.identified:
+        return FuelCoefficient(physical, variant, physical, estimate, 0.0, estimate.note)
+    assert estimate.se is not None
+    jackknife = jackknife_se(laps)
+    if jackknife is None:
+        reason = "a estimativa depende de poucos pilotos (jackknife sem retiradas suficientes)"
+        return FuelCoefficient(physical, variant, physical, estimate, 0.0, reason)
+    data = data_weight(laps_until(rows, upto_lap))
+    kappa, weight = shrink_coefficient(
+        estimate.kappa, max(estimate.se, jackknife), physical, data=data
+    )
+    reason = f"peso do estimado {weight:.2f} (dados {data:.2f})"
+    return FuelCoefficient(kappa, variant, physical, estimate, weight, reason)
+
+
+def coefficient_series(
+    rows: Sequence[LapRow],
+    *,
+    total_laps: int,
+    variant: FuelVariant,
+    first_lap: int = FIRST_SERIES_LAP,
+) -> list[FuelCoefficient]:
+    """O `k` da variante em cada volta de `first_lap` ao fim, só com dados até aquela volta."""
+    return [
+        fuel_coefficient(rows, upto_lap=n, total_laps=total_laps, variant=variant)
+        for n in range(first_lap, total_laps + 1)
+    ]
+
+
+def max_step(series: Sequence[FuelCoefficient]) -> float:
+    """O maior salto de `k` entre voltas consecutivas (0 se há menos de duas voltas)."""
+    return max(
+        (abs(b.kappa - a.kappa) for a, b in zip(series, series[1:], strict=False)), default=0.0
+    )
+
+
+def weight_drops(series: Sequence[FuelCoefficient], tolerance: float = 0.01) -> int:
+    """Quantas vezes o peso do estimado CAIU de uma volta para a seguinte em mais de `tolerance`
+    (oscilações de quarta casa decimal perto de w = 1 não são quedas, são ruído numérico)."""
+    return sum(
+        1 for a, b in zip(series, series[1:], strict=False) if b.weight < a.weight - tolerance
+    )
+
+
 # ---------------------------------------------------------------- degradação e sensibilidade
 
 
@@ -284,13 +465,21 @@ class RaceFuelReport:
     total_laps: int
     n_laps: int  # voltas limpas e secas
     physical: float
-    full: FuelChoice
-    progress: dict[float, FuelChoice]
+    full: FuelChoice  # a regra binária com a corrida inteira
+    progress: dict[float, FuelChoice]  # a regra binária com dados só até cada fração
     sensitivity: list[SensitivityPoint]
-    chosen: dict[str, CompoundSlope]  # a degradação com o k que o critério escolheu
+    chosen: dict[str, CompoundSlope]  # a degradação com o k que a regra escolheu
+    full_shrink: FuelCoefficient  # o encolhimento com a corrida inteira
+    shrink_progress: dict[float, FuelCoefficient]  # ... e com dados só até cada fração
+    # k volta a volta (cada um só com dados até a sua volta); só com `with_series`, que custa
+    # ~20 reajustes por volta (o jackknife).
+    rule_series: list[FuelCoefficient] | None = None
+    shrink_series: list[FuelCoefficient] | None = None
 
 
-def analyze_race(label: str, rows: Sequence[LapRow], total_laps: int) -> RaceFuelReport:
+def analyze_race(
+    label: str, rows: Sequence[LapRow], total_laps: int, *, with_series: bool = False
+) -> RaceFuelReport:
     laps = dry_clean_laps(rows)
     physical = physical_coefficient(total_laps)
     progress = {
@@ -300,6 +489,16 @@ def analyze_race(label: str, rows: Sequence[LapRow], total_laps: int) -> RaceFue
         for fraction in PROGRESS_FRACTIONS
     }
     full = choose_fuel_coefficient(estimate_fuel_coefficient(laps), physical)
+
+    def shrink(upto: int) -> FuelCoefficient:
+        return fuel_coefficient(
+            rows, upto_lap=upto, total_laps=total_laps, variant=FuelVariant.ENCOLHIMENTO
+        )
+
+    series = {}
+    if with_series:
+        for variant in (FuelVariant.ESTIMADO, FuelVariant.ENCOLHIMENTO):
+            series[variant] = coefficient_series(rows, total_laps=total_laps, variant=variant)
     return RaceFuelReport(
         label=label,
         total_laps=total_laps,
@@ -309,14 +508,23 @@ def analyze_race(label: str, rows: Sequence[LapRow], total_laps: int) -> RaceFue
         progress=progress,
         sensitivity=sensitivity(laps, physical),
         chosen={s.compound: s for s in compound_slopes(laps, full.kappa)},
+        full_shrink=shrink(total_laps),
+        shrink_progress={f: shrink(round(f * total_laps)) for f in PROGRESS_FRACTIONS},
+        rule_series=series.get(FuelVariant.ESTIMADO),
+        shrink_series=series.get(FuelVariant.ENCOLHIMENTO),
     )
 
 
-def load_reports(session, year: int | None = None) -> tuple[list[RaceFuelReport], list[str]]:
+def load_reports(
+    session, year: int | None = None, *, with_series: bool = False
+) -> tuple[list[RaceFuelReport], list[str]]:
     """Relatório das corridas do backtest principal (secas) e, à parte, as que ficaram de fora."""
     main, separate = split_population(session, year)
     reports = [
-        analyze_race(r.label, load_race_laps(session, r.race_id), r.total_laps) for r in main
+        analyze_race(
+            r.label, load_race_laps(session, r.race_id), r.total_laps, with_series=with_series
+        )
+        for r in main
     ]
     return reports, [f"{r.label}: {r.reason}" for r in separate]
 
@@ -364,16 +572,47 @@ def full_table(reports: Sequence[RaceFuelReport]) -> list[list[str]]:
 
 
 def progress_table(reports: Sequence[RaceFuelReport]) -> list[list[str]]:
-    header = ["corrida", *[f"até {pct(f)} da corrida" for f in PROGRESS_FRACTIONS]]
+    header = ["corrida"]
+    for f in PROGRESS_FRACTIONS:
+        header += [f"regra até {pct(f)}", f"encolhimento até {pct(f)} (k/físico, peso)"]
     rows = [header]
     for r in reports:
         cells = []
         for f in PROGRESS_FRACTIONS:
-            c = r.progress[f]
-            cells.append(
-                f"{c.source} ({_num(c.ratio, 2)}x)" if c.ratio is not None else "físico (-)"
-            )
+            rule, shrunk = r.progress[f], r.shrink_progress[f]
+            cells += [
+                f"{rule.source} ({_num(rule.ratio, 2)}x)"
+                if rule.ratio is not None
+                else "físico (-)",
+                f"{shrunk.kappa / r.physical:.2f}x (w {shrunk.weight:.2f})",
+            ]
         rows.append([r.label, *cells])
+    return rows
+
+
+def smoothness_table(reports: Sequence[RaceFuelReport]) -> list[list[str]]:
+    header = [
+        "corrida",
+        "maior passo, regra (s/volta)",
+        "maior passo, encolhimento",
+        "voltas em que o peso caiu",
+        "k final / físico, regra",
+        "k final / físico, encolhimento",
+    ]
+    rows = [header]
+    for r in reports:
+        if r.rule_series is None or r.shrink_series is None:
+            continue
+        rows.append(
+            [
+                r.label,
+                _num(max_step(r.rule_series)),
+                _num(max_step(r.shrink_series)),
+                f"{weight_drops(r.shrink_series)} de {len(r.shrink_series) - 1}",
+                f"{r.rule_series[-1].kappa / r.physical:.2f}x",
+                f"{r.shrink_series[-1].kappa / r.physical:.2f}x",
+            ]
+        )
     return rows
 
 
@@ -476,10 +715,42 @@ def _summary(reports: Sequence[RaceFuelReport], skipped: Sequence[str]) -> list[
     lines += _sensitivity_summary(reports)
     for fraction in PROGRESS_FRACTIONS:
         n = sum(r.progress[fraction].source == "estimado" for r in reports)
+        weights = [r.shrink_progress[fraction].weight for r in reports]
         lines.append(
-            f"- Com dados só até {pct(fraction)} da corrida: estimado em {n} de {len(reports)}."
+            f"- Com dados só até {pct(fraction)} da corrida: a regra usa o estimado em {n} de "
+            f"{len(reports)}; no encolhimento o peso do estimado tem mediana {median(weights):.2f}."
         )
+    lines += _smoothness_summary(reports)
     return lines
+
+
+def _smoothness_summary(reports: Sequence[RaceFuelReport]) -> list[str]:
+    with_series = [r for r in reports if r.rule_series and r.shrink_series]
+    if not with_series:
+        return []
+    rule = [max_step(r.rule_series) for r in with_series]
+    shrunk = [max_step(r.shrink_series) for r in with_series]
+    drops = sum(weight_drops(r.shrink_series) for r in with_series)
+    laps = sum(len(r.shrink_series) - 1 for r in with_series)
+    margin = 0.001  # diferenças menores que 1 milésimo de s/volta contam como empate
+    better = sum(sh < ru - margin for ru, sh in zip(rule, shrunk, strict=True))
+    worse = [
+        r.label for r, ru, sh in zip(with_series, rule, shrunk, strict=True) if sh > ru + margin
+    ]
+    return [
+        "- Maior passo de `k` entre voltas consecutivas, por corrida (s/volta): regra binária com "
+        f"mediana {median(rule):.3f} e máximo {max(rule):.3f}; encolhimento com mediana "
+        f"{median(shrunk):.3f} e máximo {max(shrunk):.3f}. O degrau da troca de fonte some, mas o "
+        "`k` estimado ainda oscila a cada volta que chega: o encolhimento não o torna constante.",
+        f"- O encolhimento tem o maior passo menor que o da regra em {better} de "
+        f"{len(with_series)} "
+        f"corridas, empata (diferença < {margin}) em {len(with_series) - better - len(worse)} e é "
+        f"PIOR em {len(worse)}" + (f" ({'; '.join(worse)})" if worse else "") + ". Pior não é "
+        "necessariamente defeito: onde o estimado diverge muito do físico, a regra nunca sai do "
+        "físico (passo 0) e o encolhimento caminha até o teto de 2x.",
+        f"- O peso do estimado caiu de uma volta para a seguinte em {drops} de {laps} voltas "
+        f"({drops / laps:.0%}): `w` sobe em tendência, não volta a volta.",
+    ]
 
 
 MARKDOWN_METHOD = """\
@@ -497,6 +768,15 @@ MARKDOWN_METHOD = """\
 - **Critério** (fixado antes de olhar os resultados): o estimado só é usado se for identificável,
   preciso (erro-padrão de no máximo metade do físico) e parecido (razão de 0,5 a 2 em relação ao
   físico). Senão usa o físico e a coluna `motivo` diz por quê.
+- **Encolhimento contínuo**: `k = w * estimado_limitado + (1 - w) * físico`, com
+  `w = t^2 / (t^2 + se^2)`, `t` = 50% do físico (a priori) e `se` = o maior entre o erro-padrão por
+  cluster e o do jackknife por piloto (o quanto o estimado muda quando se tira um piloto). Sem
+  estimativa, `w = 0`. O estimado é limitado a 0,5x..2x do físico (os mesmos limites do critério,
+  que não foi apertado). A primeira versão usava só o erro-padrão por cluster e ficou **menos
+  suave** que a regra (cedo na corrida o estimador devolve valores absurdos com erro-padrão
+  pequeno); o jackknife e o limite corrigem isso. Só usa voltas até a volta N.
+- **Variantes do backtest**: `fisico`, `estimado` (a regra binária) e `encolhimento`. Os números do
+  backtest decidem o padrão.
 - **Sensibilidade**: a degradação de cada composto (inclinação do tempo corrigido contra a idade,
   intercepto por stint) para `k` de 0 a 2 vezes o físico. Dentro do stint
   `volta = idade + constante`, então **cada +0,01 s/volta de `k` soma exatamente +0,01 s/volta à
@@ -517,9 +797,14 @@ def build_report(
         return (
             f"{summary}\n\n"
             f"ESTIMADO x FÍSICO (corrida inteira)\n{render_text(full_table(reports))}\n\n"
-            f"DECISÃO COM DADOS ATÉ CADA FRAÇÃO DA CORRIDA\n"
+            f"REGRA E ENCOLHIMENTO COM DADOS ATÉ CADA FRAÇÃO DA CORRIDA\n"
             f"{render_text(progress_table(reports))}\n\n"
-            f"SENSIBILIDADE DA DEGRADAÇÃO (s por volta de idade) AO COEFICIENTE\n"
+            + (
+                f"SUAVIDADE VOLTA A VOLTA\n{render_text(smoothness_table(reports))}\n\n"
+                if len(smoothness_table(reports)) > 1
+                else ""
+            )
+            + f"SENSIBILIDADE DA DEGRADAÇÃO (s por volta de idade) AO COEFICIENTE\n"
             f"{render_text(sensitivity_table(reports))}\n"
         )
     day = (generated_on or date.today()).isoformat()
@@ -530,9 +815,15 @@ def build_report(
         f"## Resumo\n\n{summary}\n\n{MARKDOWN_METHOD}\n"
         "## Estimado x físico, com a corrida inteira\n\n"
         f"{render_markdown(full_table(reports))}\n\n"
-        "## Decisão com dados só até cada fração da corrida (sem o futuro)\n\n"
+        "## Regra e encolhimento com dados só até cada fração da corrida (sem o futuro)\n\n"
         f"{render_markdown(progress_table(reports))}\n\n"
-        "## Sensibilidade: degradação (s por volta de idade) para `k` de 0 a 2x o físico\n\n"
+        + (
+            "## Suavidade volta a volta: o maior salto de `k` entre voltas consecutivas\n\n"
+            f"{render_markdown(smoothness_table(reports))}\n\n"
+            if len(smoothness_table(reports)) > 1
+            else ""
+        )
+        + "## Sensibilidade: degradação (s por volta de idade) para `k` de 0 a 2x o físico\n\n"
         f"{render_markdown(sensitivity_table(reports))}\n"
     )
 
@@ -547,11 +838,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--markdown", type=Path, default=None, help="grava o relatório neste arquivo .md"
     )
+    parser.add_argument(
+        "--no-series",
+        action="store_true",
+        help="pula a suavidade volta a volta (custa ~20 reajustes por volta; minutos)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING)
 
     with get_session_factory()() as session:
-        reports, skipped = load_reports(session, args.year)
+        reports, skipped = load_reports(session, args.year, with_series=not args.no_series)
     if not reports:
         print(
             "Nenhuma corrida seca no banco. Ingira com: python -m ingestion --year 2024 --round 10"
