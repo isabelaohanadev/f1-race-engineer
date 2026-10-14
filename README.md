@@ -292,6 +292,14 @@ curl -s "localhost:8000/races/2024/21/laps?driver=VER" | head -c 600
 docker compose run --rm app python -m ingestion --year 2024 --round 6 --laps-only
 ```
 
+Para ver o que entrou, e se dá para confiar nisso, rode o inspetor de qualidade das voltas (relatório
+em `docs/qualidade-dos-dados.md`, com a legenda de cada coluna):
+
+```bash
+python -m strategy.quality                                         # tabelas no terminal
+python -m strategy.quality --markdown docs/qualidade-dos-dados.md  # e grava o relatório
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -572,6 +580,35 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 - O contador de linhas do SQLAlchemy devolve `-1` em `INSERT`; o relatório de idempotência usa
   `preserve_rowcount` para mostrar números reais.
 
+**Fase 3 (voltas de 24 corridas de 2024, ver `docs/qualidade-dos-dados.md`):**
+
+- **O GP do Brasil foi corrida de chuva**: 1.116 voltas INTERMEDIATE e 18 WET, nenhuma de pista seca.
+  Serve para o replay, não para ajustar desgaste de pneu seco. Das 24 corridas, 21 são 100% secas.
+- **"Descartar voltas sem tempo" não remove as voltas de box.** Nas 21 corridas secas, 97% das voltas
+  de entrada nos boxes (703 de 722) têm tempo de volta registrado; só na corrida de chuva a proporção
+  cai para metade. Quem filtrasse só por "tem tempo" manteria quase todas as voltas lentas de box na
+  regressão. Por isso a ingestão passou a guardar `pit_in`, `pit_out` e `track_status`.
+- **`t0_date` só existe com a telemetria carregada.** O FastF1 o deduz das amostras de posição e
+  levanta `DataNotLoadedError` sem elas. Sem `t0_date` não há horário absoluto das voltas, então o
+  `--laps-only` guarda só o relógio da sessão (`session_time_ms`), que é o mesmo para todos os
+  pilotos e basta para o intervalo entre carros, e nunca toca no `completed_at` de uma corrida
+  completa.
+- **O resultado oficial e o tempo da volta 1 dependem de uma API externa (Ergast/Jolpica).** Pelo
+  código do FastF1 (`_add_first_lap_time_from_ergast` e o cálculo de resultado alternativo), quando
+  ela não responde a carga segue sem erro: a ordem de chegada é *calculada* a partir das voltas, o
+  que sai completo (1..N) mas sem `status`, e o tempo da volta 1 fica nulo. Foi o que se observou:
+  6 das 19 corridas ingeridas só com voltas chegaram assim na primeira passada, e Miami e a Espanha
+  alteraram 20 voltas (a Espanha também 20 inscrições) entre duas cargas idênticas. A ingestão é
+  idempotente **e converge**: reingerir traz o dado oficial e a passada seguinte volta a alterar 0
+  linhas. A causa (a API externa) é inferida do código e do comportamento; o aviso de erro dessas
+  cargas não foi capturado. O sinal para detectar é `sem_status > 0` no inspetor.
+- **Resultado oficial não é ordem na pista.** No GP da Bélgica o Russell venceu na pista e foi
+  desqualificado depois: o oficial desloca os 20 pilotos em relação à última volta. O backtest
+  precisa dizer qual dos dois é a "verdade".
+- Fora isso a estrutura é limpa: 0 buracos de volta, 0 saltos na idade do pneu, 0 trocas de composto
+  dentro do stint, 0 relógios que não crescem e 0 discordâncias entre tempo de volta e relógio da
+  sessão ou entre posição e ordem de chegada (as checagens têm testes que plantam o defeito).
+
 ## Limitações conhecidas
 
 - **A classificação é a ordem *na pista*, não a oficial.** É derivada das voltas (mais voltas primeiro,
@@ -611,6 +648,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
+strategy/       estratégia (Fase 3): por ora a inspeção de qualidade das voltas
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
