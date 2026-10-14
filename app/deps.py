@@ -5,6 +5,8 @@ from redis.asyncio import Redis
 from sqlalchemy.orm import Session
 
 from db.session import get_session_factory
+from replay.control import RedisControlPlane
+from replay.manager import ReplayManager
 
 
 def get_db() -> Iterator[Session]:
@@ -26,3 +28,14 @@ def get_redis(request: Request) -> Redis:
     `app.dependency_overrides[get_redis]` troca o Redis real por um de teste.
     """
     return request.app.state.redis
+
+
+def get_replay_manager(request: Request) -> ReplayManager:
+    """O gerenciador de replays DESTA instância (criado no lifespan). Só serve para `start`: o
+    resto do controle vai pelo Redis (ver get_control), para funcionar de qualquer instância."""
+    return request.app.state.replay_manager
+
+
+def get_control(request: Request) -> RedisControlPlane:
+    """O plano de controle (status e comandos) sobre o Redis: o mesmo em todas as instâncias."""
+    return request.app.state.control

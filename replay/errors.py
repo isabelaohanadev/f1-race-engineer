@@ -23,3 +23,7 @@ class ReplayNotRunning(ReplayError):
 
 class InvalidSpeed(ReplayError):
     """Velocidade fora das permitidas (1x, 4x, 16x)."""
+
+
+class ReplayTimeout(ReplayError):
+    """O replay existe, mas o processo dono não confirmou o comando a tempo (travado ou caindo)."""

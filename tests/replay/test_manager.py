@@ -22,10 +22,12 @@ from replay.manager import ReplayManager
 from tests.replay.conftest import NOR, VER, at
 from tests.replay.fakes import (
     FakeClock,
+    FakeControl,
     FakeLock,
     FakeLockRegistry,
     FakePublisher,
     FakeState,
+    ManualClock,
     settle,
 )
 
@@ -39,8 +41,11 @@ async def fast_sleep(_: float) -> None:
 class World:
     """Um gerenciador ligado a dublês, com acesso a tudo que ele criou."""
 
-    def __init__(self, session_factory, registry: FakeLockRegistry | None = None) -> None:
-        self.clock = FakeClock()
+    def __init__(
+        self, session_factory, registry: FakeLockRegistry | None = None, clock=None, sleep=None
+    ) -> None:
+        self.clock = clock or FakeClock()
+        self.control = FakeControl()
         self.registry = registry or FakeLockRegistry()
         self.publisher = FakePublisher(self.clock)
         self.shared = FakeState()
@@ -52,7 +57,8 @@ class World:
             lock_factory=self._new_lock,
             publisher_factory=lambda stream, epoch: self.publisher,
             state=self.shared,
-            sleep=fast_sleep,
+            control=self.control,
+            sleep=sleep or fast_sleep,
         )
 
     def _new_lock(self, year: int, round_number: int) -> FakeLock:
@@ -299,3 +305,130 @@ async def test_shutdown_stops_every_replay_and_releases_every_lock(world, seed):
 
     assert world.state(RACE) is world.state((2023, 1)) is ReplayState.STOPPED
     assert world.registry.owners == {}
+
+
+# ---------------------------------------------------------------- status e controle REMOTOS
+
+
+async def test_start_publishes_the_status_before_returning(world):
+    await world.manager.start(*RACE)
+
+    assert world.control.resets == 1  # a fila de comandos começou limpa
+    status, epoch, owner = world.control.statuses[0]
+    # Já existe para quem consultar de outra instância; e diz de quem é o replay.
+    assert (status.state, epoch, owner) == (ReplayState.PENDING, 1, world.manager.owner)
+
+
+async def test_the_heartbeat_keeps_republishing_the_status(world):
+    await world.start_paused()
+    published = len(world.control.statuses)
+
+    await settle(lambda: len(world.control.statuses) >= published + 3)
+
+    assert world.control.last_status.state is ReplayState.PAUSED
+
+
+async def test_the_final_status_is_terminal(world):
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.FINISHED)
+    await settle(lambda: world.registry.owners == {})  # supervisor terminou
+
+    assert world.control.last_status.state is ReplayState.FINISHED  # vira TTL longo no Redis
+
+
+@pytest.fixture
+def manual_world(seed, session_factory) -> World:
+    """Um replay que fica VIVO (esperando) até um comando mexer nele."""
+    seed(positions=[(VER, at(0), 0, 0), (VER, at(60_000), 1, 1)], total_laps=3)
+    return World(session_factory, clock=ManualClock())
+
+
+async def test_remote_commands_are_executed_by_the_owner_and_answered(manual_world):
+    world = manual_world
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.RUNNING)
+
+    pause = world.control.send("pause")  # (como se viesse de OUTRA instância da API)
+    await settle(lambda: pause in world.control.replies)
+    assert world.control.replies[pause].ok
+    assert world.state() is ReplayState.PAUSED  # o dono executou
+    assert (
+        world.control.replies[pause].info.status.state is ReplayState.PAUSED
+    )  # e respondeu o novo
+
+    speed = world.control.send("speed", 16)
+    await settle(lambda: speed in world.control.replies)
+    assert world.control.replies[speed].info.status.speed == 16.0
+    assert world.state() is ReplayState.PAUSED  # trocar a velocidade não retoma
+
+    resume = world.control.send("resume")
+    await settle(lambda: resume in world.control.replies)
+    assert world.state() is ReplayState.RUNNING
+
+    stop = world.control.send("stop")
+    await settle(lambda: stop in world.control.replies)
+    assert world.control.replies[stop].info.status.state is ReplayState.STOPPED  # estado FINAL
+    await settle(lambda: world.registry.owners == {})
+    assert world.control.last_status.state is ReplayState.STOPPED
+
+
+@pytest.mark.parametrize(
+    ("name", "arg", "error"),
+    [
+        ("speed", 3, "invalid_speed"),
+        ("speed", None, "invalid_speed"),
+        ("dance", None, "unknown_command"),
+    ],
+)
+async def test_invalid_remote_commands_get_an_error_reply_and_change_nothing(
+    manual_world, name, arg, error
+):
+    world = manual_world
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.RUNNING)
+
+    command = world.control.send(name, arg)
+    await settle(lambda: command in world.control.replies)
+
+    reply = world.control.replies[command]
+    assert (reply.ok, reply.error) == (False, error)
+    assert world.state() is ReplayState.RUNNING and world.manager.status(*RACE).speed == 1.0
+    await world.manager.stop(*RACE)
+
+
+async def test_a_command_sent_right_after_start_is_not_lost(manual_world):
+    """A janela clássica: o POST /start devolve e, no mesmo instante, outra instância manda
+    /pause, antes de o dono ter começado a ler. O comando espera na fila e é executado."""
+    world = manual_world
+    await world.manager.start(*RACE)
+    command = world.control.send("pause")  # nem deu tempo de o motor sair de PENDING
+
+    await settle(lambda: command in world.control.replies)
+
+    assert world.state() is ReplayState.PAUSED
+    await world.manager.stop(*RACE)
+
+
+async def never_ticks(_: float) -> None:
+    await asyncio.Event().wait()  # o heartbeat não bate: só o supervisor publica status
+
+
+async def test_the_terminal_status_is_published_before_the_stop_is_answered(seed, session_factory):
+    """Quem recebe a resposta do `stop` e manda outro comando em seguida tem de encontrar o status
+    JÁ terminal (409 imediato). Se a resposta saísse antes, ele veria um status "ativo" velho e
+    esperaria o timeout inteiro (visto em teste real com duas instâncias da API).
+
+    O heartbeat fica mudo de propósito: com o `sleep` rápido dos outros testes ele publicaria um
+    "stopped" espúrio por conta própria, e o teste passaria mesmo com a ordem errada."""
+    seed(positions=[(VER, at(0), 0, 0), (VER, at(60_000), 1, 1)], total_laps=3)
+    world = World(session_factory, clock=ManualClock(), sleep=never_ticks)
+    await world.manager.start(*RACE)
+    await settle(lambda: world.state() is ReplayState.RUNNING)
+
+    stop = world.control.send("stop")
+    await settle(lambda: stop in world.control.replies)
+
+    log = world.control.log
+    reply_at = log.index(("reply", stop))
+    assert log[reply_at - 1] == ("status", "stopped")  # o terminal vem logo ANTES da resposta
+    assert ("status", "running") not in log[reply_at:]  # e nada "ativo" sobrescreve depois

@@ -3,27 +3,39 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.errors import register_exception_handlers
 from app.redis_client import create_redis
-from app.routers import health, races
+from app.routers import health, races, replay
+from db.session import get_session_factory
+from replay.control import RedisControlPlane
+from replay.manager import ReplayManager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # O cliente Redis assíncrono pertence ao event loop do servidor: nasce e morre com ele. A
     # criação não conecta (é lazy), então a API sobe mesmo com o Redis fora do ar.
-    app.state.redis = create_redis()
+    redis = create_redis()
+    app.state.redis = redis
+    app.state.control = RedisControlPlane(redis)
+    app.state.replay_manager = ReplayManager(get_session_factory(), redis)
     try:
         yield
     finally:
-        await app.state.redis.aclose()
+        # Para os replays que ESTA instância roda e libera os locks (senão a corrida ficaria
+        # "em replay em outro processo" até o TTL do lock expirar).
+        await app.state.replay_manager.shutdown()
+        await redis.aclose()
 
 
 app = FastAPI(
     title="F1 Race Engineer",
-    description="API sobre dados de corridas de F1 ingeridos via FastF1.",
-    version="0.1.0",
+    description="API sobre dados de corridas de F1 ingeridos via FastF1, com replay em streaming.",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
+register_exception_handlers(app)
 app.include_router(health.router)
 app.include_router(races.router)
+app.include_router(replay.router)

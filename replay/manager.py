@@ -10,20 +10,37 @@ GARANTIA "UM REPLAY POR CORRIDA", em duas camadas:
 Quem segura o lock o renova a cada TTL/3 (heartbeat). Se o processo morrer, o lock expira sozinho em
 até TTL e a corrida pode ser iniciada de novo; se a renovação descobrir que o lock passou a ser de
 outro, o replay local se aborta (FAILED) em vez de escrever no mesmo stream que o novo dono.
+
+CONTROLE ENTRE PROCESSOS (ver control.py): este processo é o DONO do replay que iniciou. Ele
+publica o status no Redis a cada ~1 s e a cada mudança, e escuta o stream de comandos: um
+`POST /pause` recebido por QUALQUER instância da API vira um comando no Redis que o dono executa
+(`_execute`) e responde. Os métodos locais (`pause`, `resume`, `set_speed`, `stop`) continuam
+existindo para o próprio processo dono.
 """
 
 import asyncio
 import contextlib
 import logging
+import os
+import socket
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.redis_client import MAX_BLOCK_MS
 from replay.clock import Clock
+from replay.control import (
+    Command,
+    CommandResult,
+    ControlPlane,
+    RedisControlPlane,
+    ReplayInfo,
+)
 from replay.engine import ReplayEngine, ReplayStatus
 from replay.errors import InvalidSpeed, ReplayAlreadyRunning, ReplayNotRunning
 from replay.events import stream_key
@@ -35,6 +52,11 @@ from replay.state import RaceStateStore
 logger = logging.getLogger(__name__)
 
 ALLOWED_SPEEDS = (1.0, 4.0, 16.0)
+
+# O status é republicado a cada ~1 s (e o TTL dele é 10 s); o lock é renovado no mesmo ritmo.
+STATUS_INTERVAL_S = 1.0
+CONTROL_BLOCK_MS = 1_000  # quanto o dono espera por comandos por leitura (< MAX_BLOCK_MS)
+assert CONTROL_BLOCK_MS < MAX_BLOCK_MS
 
 RaceKey = tuple[int, int]  # (year, round)
 
@@ -56,9 +78,15 @@ class Lock(Protocol):
 
 @dataclass(slots=True)
 class _Run:
+    year: int
+    round_number: int
+    epoch: int
     engine: ReplayEngine
     lock: Lock
     task: asyncio.Task[None] | None = None
+    finished: asyncio.Event = field(default_factory=asyncio.Event)  # o motor terminou
+    # Comandos `stop` já executados cuja RESPOSTA espera o motor terminar (ver `_execute`).
+    stop_replies: list[str] = field(default_factory=list)
 
 
 class ReplayManager:
@@ -74,6 +102,8 @@ class ReplayManager:
         lock_factory: Callable[[int, int], Lock] | None = None,
         publisher_factory: Callable[[str, int], Publisher] | None = None,
         state: StateRegistry | None = None,
+        control: ControlPlane | None = None,
+        owner: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._session_factory = session_factory
@@ -87,6 +117,9 @@ class ReplayManager:
             lambda stream, epoch: StreamPublisher(redis, stream, epoch, maxlen)
         )
         self._state: StateRegistry = state or RaceStateStore(redis)
+        self._control: ControlPlane = control or RedisControlPlane(redis)
+        # Quem sou eu, para quem consulta o status saber QUAL instância é a dona do replay.
+        self.owner = owner or f"{socket.gethostname()}-{os.getpid()}"
         self._runs: dict[RaceKey, _Run] = {}  # o último replay de cada corrida (ativo ou não)
         self._starting: set[RaceKey] = set()  # reservas de start() ainda em andamento
 
@@ -141,12 +174,17 @@ class ReplayManager:
                 publisher = self._publisher_factory(stream_key(year, round_number), epoch)
                 await self._state.register_stream(year, round_number)  # os workers o descobrem
                 await publisher.reset()
+                await self._control.reset(year, round_number)  # fila de comandos limpa
                 engine = ReplayEngine(source, publisher, clock=self._clock, speed=speed)
+                run = _Run(year, round_number, epoch, engine, lock)
+                # O status existe ANTES de o start devolver: um `POST /pause` que chegue em outra
+                # instância logo em seguida já encontra o replay (e o comando fica na fila até o
+                # dono começar a ler, que parte do "0-0").
+                await self._publish_status(run)
             except BaseException:  # inclui cancelamento (cliente desconectou no meio do start)
                 await self._release_quietly(lock)
                 raise
 
-            run = _Run(engine, lock)
             run.task = asyncio.create_task(
                 self._supervise(run), name=f"replay-{year}-{round_number}"
             )
@@ -192,18 +230,51 @@ class ReplayManager:
 
     # ------------------------------------------------------------------ supervisão
 
+    def _info(self, run: _Run) -> ReplayInfo:
+        return ReplayInfo(run.engine.status(), run.epoch, self.owner, int(time.time() * 1000))
+
+    async def _publish_status(self, run: _Run) -> None:
+        await self._control.publish_status(
+            run.year, run.round_number, run.engine.status(), epoch=run.epoch, owner=self.owner
+        )
+
+    async def _publish_status_quietly(self, run: _Run) -> None:
+        try:
+            await self._publish_status(run)
+        except (RedisError, OSError):
+            # O status é republicado no próximo ciclo; falhar em publicá-lo não pode matar o replay.
+            logger.warning("Não consegui publicar o status do replay", exc_info=True)
+
     async def _supervise(self, run: _Run) -> None:
         heartbeat = asyncio.create_task(self._heartbeat(run))
+        control = asyncio.create_task(self._control_loop(run))
+        engine_task = asyncio.create_task(run.engine.run())
+        engine_task.add_done_callback(lambda _: run.finished.set())
         try:
-            await run.engine.run()
+            await asyncio.sleep(0)  # deixa o motor sair de PENDING...
+            await self._publish_status_quietly(run)  # ...e publica já como "running"
+            await engine_task
         finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+            # ORDEM IMPORTA. 1) Para os laços que também publicam status: nenhum pode gravar um
+            # status "ativo" velho POR CIMA do final.
+            for task in (heartbeat, control):
+                task.cancel()
+            for task in (heartbeat, control):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            # 2) Publica o status FINAL (terminal, TTL longo) ANTES de responder ao `stop`: quem
+            # recebe a resposta e manda outro comando logo em seguida já encontra "terminou" (409
+            # imediato), em vez de achar um status ativo velho e esperar o timeout.
+            await self._publish_status_quietly(run)
+            # 3) A resposta do `stop` (estado FINAL) sai DAQUI, não do laço de comandos: o
+            # cancelamento acima o interromperia antes de responder, e o `POST /stop` daria
+            # timeout mesmo tendo funcionado.
+            await self._reply_to_stops(run)
             await self._release_quietly(run.lock)
 
     async def _heartbeat(self, run: _Run) -> None:
-        interval_s = run.lock.ttl_ms / 1000 / 3  # 3 tentativas de renovar antes de expirar
+        # 3 tentativas de renovar o lock antes de expirar, e no máximo 1 s entre status.
+        interval_s = min(run.lock.ttl_ms / 1000 / 3, STATUS_INTERVAL_S)
         while True:
             await self._sleep(interval_s)
             try:
@@ -215,11 +286,69 @@ class ReplayManager:
                 logger.warning(
                     "Não consegui renovar o lock do replay; tento de novo", exc_info=True
                 )
-                continue
+                still_mine = True
             if not still_mine:
                 logger.error("Lock do replay perdido: abortando para não duplicar eventos")
                 run.engine.abort("lock do replay perdido (outro processo assumiu a corrida?)")
+                await self._publish_status_quietly(run)
                 return
+            await self._publish_status_quietly(run)
+
+    # ------------------------------------------------------------------ comandos remotos
+
+    async def _control_loop(self, run: _Run) -> None:
+        """Executa, neste processo (o dono), os comandos que qualquer instância mandou."""
+        after_id = "0-0"  # a fila foi limpa no start: tudo o que há nela é para ESTE replay
+        while True:
+            try:
+                commands, after_id = await self._control.read_commands(
+                    run.year, run.round_number, after_id, CONTROL_BLOCK_MS
+                )
+            except (RedisError, OSError):
+                logger.warning("Não consegui ler os comandos do replay", exc_info=True)
+                await self._sleep(1.0)
+                continue
+            for command in commands:
+                result = await self._execute(run, command)
+                if result is None:  # resposta adiada (stop): quem responde é o supervisor
+                    continue
+                await self._reply(run, command.id, result)
+                await self._publish_status_quietly(run)
+
+    async def _reply(self, run: _Run, command_id: str, result: CommandResult) -> None:
+        try:
+            await self._control.reply(run.year, run.round_number, command_id, result)
+        except (RedisError, OSError):
+            logger.warning("Não consegui responder ao comando", exc_info=True)
+
+    async def _reply_to_stops(self, run: _Run) -> None:
+        for command_id in run.stop_replies:
+            await self._reply(run, command_id, CommandResult(True, info=self._info(run)))
+        run.stop_replies.clear()
+
+    async def _execute(self, run: _Run, command: Command) -> CommandResult | None:
+        engine = run.engine
+        match command.name:
+            case "pause":
+                engine.pause()
+            case "resume":
+                engine.resume()
+            case "speed":
+                try:
+                    if command.arg is None:
+                        raise InvalidSpeed("o comando `speed` precisa de uma velocidade")
+                    engine.set_speed(self._check_speed(command.arg))
+                except InvalidSpeed as exc:
+                    return CommandResult(False, error="invalid_speed", detail=str(exc))
+            case "stop":
+                engine.stop()
+                run.stop_replies.append(command.id)  # responde com o estado FINAL (ver supervisor)
+                return None
+            case _:
+                return CommandResult(
+                    False, error="unknown_command", detail=f"comando desconhecido: {command.name!r}"
+                )
+        return CommandResult(True, info=self._info(run))
 
     @staticmethod
     async def _release_quietly(lock: Lock) -> None:

@@ -12,6 +12,8 @@ from collections.abc import AsyncIterator, Callable, Sequence
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+from replay.control import Command, CommandResult
+from replay.engine import ReplayStatus
 from replay.events import PositionEvent, ReplayEvent
 
 
@@ -42,6 +44,61 @@ class FakeClock:
             self.now = deadline
             break
         await asyncio.sleep(0)  # cede o loop (outras tarefas, como o heartbeat, têm a vez)
+
+
+class ManualClock(FakeClock):
+    """Um relógio que NÃO avança sozinho: `wait()` só volta quando alguém acorda o motor (um
+    comando de pausa, velocidade ou parada). Mantém o replay vivo, esperando, até o teste agir."""
+
+    async def wait(self, timeout: float, wake: asyncio.Event) -> None:
+        await wake.wait()
+        await asyncio.sleep(0)
+
+
+class FakeControl:
+    """O plano de controle em memória: guarda o status publicado e entrega os comandos que o
+    teste injeta com `send()`. É o que o Redis faria entre a instância da API e o dono."""
+
+    def __init__(self) -> None:
+        self.resets = 0
+        self.statuses: list[tuple[ReplayStatus, int, str]] = []
+        self.replies: dict[str, CommandResult] = {}
+        self.log: list[tuple[str, str]] = []  # ("status", estado) / ("reply", id), em ordem
+        self._commands: asyncio.Queue[Command] = asyncio.Queue()
+        self._ids = itertools.count(1)
+
+    async def reset(self, year: int, round_number: int) -> None:
+        self.resets += 1
+
+    async def publish_status(
+        self, year: int, round_number: int, status: ReplayStatus, *, epoch: int, owner: str
+    ) -> None:
+        self.statuses.append((status, epoch, owner))
+        self.log.append(("status", status.state.value))
+
+    async def read_commands(
+        self, year: int, round_number: int, after_id: str, block_ms: int
+    ) -> tuple[list[Command], str]:
+        batch = [await self._commands.get()]  # bloqueia até chegar um comando (como o XREAD)
+        while not self._commands.empty():
+            batch.append(self._commands.get_nowait())
+        return batch, batch[-1].id
+
+    async def reply(
+        self, year: int, round_number: int, command_id: str, result: CommandResult
+    ) -> None:
+        self.replies[command_id] = result
+        self.log.append(("reply", command_id))
+
+    # ---- lado do teste
+    def send(self, name: str, arg: float | None = None) -> str:
+        command_id = f"{next(self._ids)}-0"
+        self._commands.put_nowait(Command(command_id, name, arg))
+        return command_id
+
+    @property
+    def last_status(self) -> ReplayStatus:
+        return self.statuses[-1][0]
 
 
 class FakePublisher:
