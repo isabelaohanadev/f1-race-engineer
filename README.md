@@ -308,6 +308,13 @@ em `docs/limpeza-das-voltas.md`:
 python -m strategy.cleaning --markdown docs/limpeza-das-voltas.md
 ```
 
+E o coeficiente de combustível (físico x estimado) e a sensibilidade da degradação a ele, em
+`docs/combustivel.md`:
+
+```bash
+python -m strategy.fuel --markdown docs/combustivel.md
+```
+
 ### 4. Iniciar o replay e assistir
 
 ```bash
@@ -556,6 +563,37 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Ritmo por âncora, não soma de `sleep`** | O instante de cada evento é calculado a partir do tempo de corrida (relógio monotônico); trocar a velocidade ou pausar só move a âncora. Somar `sleep` acumularia o atraso de cada um. Medido com relógio real e duas trocas de velocidade: erro entre -4 e +11 ms, sem crescer. |
 | **`MAXLEN ~ 100.000`** | O stream é um buffer de *catch-up*, não o histórico (o histórico é o banco): ~15 min a 1x e ~1 min a 16x. Medido: 4,2 MB para 100 mil entradas, então o limite é ditado pela janela de recuperação, não pela memória. |
 
+### Fase 3: estratégia
+
+| Decisão | Por quê |
+|---|---|
+| **Só entram voltas com status exatamente `"1"`** | O status vem como texto com um código por ocorrência na volta (`"1"`, `"12"`, `"26"`, `"671"`). Filtrar "sem os códigos ruins que conheço" deixaria passar um código novo; "exatamente `1`" não. A amarela custa 558 das 26.604 voltas (2%), mas 13% no Brasil; o funil (`docs/limpeza-das-voltas.md`) mostra o custo dela separado do resto. |
+| **Descartar voltas de box pela flag, não por "sem tempo"** | Nas corridas secas, 97% das voltas de entrada nos boxes têm tempo de volta (703 de 722). |
+| **Corrigir o combustível** | Pneu e combustível mexem no tempo com sinais contrários e do mesmo tamanho. Medido: sem correção, 25 das 53 linhas (corrida x composto, 30+ voltas) mostram degradação **negativa**; com o `k` físico são 7, e com o escolhido, 5. A mediana da degradação vai de +0,007 para +0,060 s por volta de idade. |
+| **`k` estimado junto com a degradação, com intercepto por piloto (não por stint)** | Dentro de um stint `volta = idade + constante`: com intercepto por stint o `k` é absorvido pela inclinação da idade e só se identifica `degradação - k`. O que os separa é comparar stints que começam em voltas diferentes, nos vários pilotos da corrida. |
+| **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. Com dados só até a volta N o estimador quase nunca se identifica cedo (com 25% da corrida entrou em 2 de 21 corridas), então o físico, que não depende dos dados, cobre o começo. |
+| **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
+
+#### O coeficiente de combustível: estimado x físico
+
+O físico é uma **suposição** (110 kg queimados linearmente, 0,03 s por kg; `k = 0,03 * 110 / voltas`,
+de 0,042 a 0,075 s/volta). Em 21 corridas secas (`docs/combustivel.md`):
+
+- O estimado é identificável nas 21; razão estimado/físico: mediana **1,20**, de 0,60 a 2,25; erro-padrão
+  mediano 0,003 s/volta. O critério escolhe o **estimado em 20** e o **físico em 1**.
+- **Mônaco divergiu**: estimado 0,095 ± 0,002 contra físico 0,042 (razão **2,25**), então usa o físico.
+  Lá o `k` físico dá degradação **negativa** (HARD -0,013, MEDIUM -0,027 s/volta), o sinal de que ele
+  subcorrige onde a pista evolui muito. Perto do limite, mas dentro dele: Arábia Saudita 1,76x, Japão
+  1,55x, China 1,46x.
+- Por que o estimado fica em geral acima do físico (mediana 1,20): ele mede a **tendência de ritmo por
+  volta da corrida**, que inclui a pista que borracha e a temperatura além do combustível. É o que se
+  precisa tirar para isolar o pneu, mas não é só combustível.
+- **Sensibilidade** (`docs/combustivel.md`): somar `k * volta` ao tempo soma `k` à inclinação da idade,
+  então cada +0,01 s/volta no coeficiente soma +0,01 s/volta à degradação estimada, em todos os
+  compostos (confirmado nos dados, desvio máximo de 1e-11); a ordem entre compostos não muda. Com
+  `k` a 0,5x a degradação mediana é +0,033 e a 1,5x é +0,085 (físico: +0,060): a escolha do
+  coeficiente move a degradação tanto quanto a própria degradação.
+
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
 
@@ -613,11 +651,31 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 - **Resultado oficial não é ordem na pista.** No GP da Bélgica o Russell venceu na pista e foi
   desqualificado depois: o oficial desloca os 20 pilotos em relação à última volta. O backtest
   precisa dizer qual dos dois é a "verdade".
+- **A degradação com o `k` físico ainda sai negativa em Arábia Saudita, Mônaco e Catar** (HARD e
+  MEDIUM, de 180 a 750 voltas cada). Testei a hipótese óbvia, que as voltas de safety car envelhecem o
+  pneu sem desgastá-lo: descontá-las da idade muda a degradação em no máximo 0,005 s/volta, então **não
+  é isso**. Em Arábia e Mônaco o `k` estimado é 1,76x e 2,25x o físico (a pista evolui), o que
+  explica a maior parte. O Catar fica sem explicação: o erro-padrão do `k` lá é o maior (0,021) e o
+  limite de voltas por jogo de pneus faz os stints começarem em voltas parecidas, o que enfraquece a
+  identificação.
 - Fora isso a estrutura é limpa: 0 buracos de volta, 0 saltos na idade do pneu, 0 trocas de composto
   dentro do stint, 0 relógios que não crescem e 0 discordâncias entre tempo de volta e relógio da
   sessão ou entre posição e ordem de chegada (as checagens têm testes que plantam o defeito).
 
 ## Limitações conhecidas
+
+**Estratégia (Fase 3, até aqui):**
+
+- **O coeficiente de combustível pode trocar de fonte no meio da corrida.** O estimado só entra quando
+  se identifica (com dados até 50% da corrida, em 17 de 21 corridas); antes disso vale o físico. A
+  troca muda o `k` de um valor para outro (na Arábia Saudita, de 0,066 para ~0,12 s/volta) e, como
+  `k` passa 1 para 1 para a degradação, a estimativa de degradação dá um salto. O backtest vai medir
+  quantas trocas ocorrem e o que custam; não há suavização.
+- **0,03 s/kg não foi validado de forma independente.** É uma suposição de engenharia; os dados só
+  dizem que o `k` total (combustível + pista) é parecido com ele em 20 de 21 corridas, o que não
+  prova que o combustível sozinho vale isso.
+- **A degradação é linear na idade** em todo o ajuste atual, sem "penhasco" no fim do stint, e supõe
+  que o ritmo de um piloto é o mesmo entre stints.
 
 - **A classificação é a ordem *na pista*, não a oficial.** É derivada das voltas (mais voltas primeiro,
   depois quem cruzou a linha antes). No GP do Brasil 2024 ela bate com a classificação oficial em
@@ -656,7 +714,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade e limpeza das voltas (cálculo puro, sem banco)
+strategy/       estratégia (Fase 3): qualidade, limpeza, regressão e combustível (cálculo puro)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
