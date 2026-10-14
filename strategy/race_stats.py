@@ -18,9 +18,9 @@ from statistics import median
 import numpy as np
 
 from db.session import get_session_factory
-from strategy.degradation import fit_degradation
 from strategy.fuel import FuelVariant
 from strategy.laps import LapRow, load_race_laps
+from strategy.pace import MIN_PAIRS, fit_pace
 from strategy.pitloss import MIN_STOPS, find_pit_stops
 from strategy.population import RaceRef, split_population
 from strategy.priors import (
@@ -46,11 +46,24 @@ def _between_compounds(model) -> float | None:
     return float(np.std(means, ddof=1)) if len(means) >= 2 else None
 
 
+_FASTER_TO_SLOWER = (("SOFT", "MEDIUM"), ("MEDIUM", "HARD"), ("SOFT", "HARD"))
+
+
+def _pair_offsets(pace) -> tuple[float, ...]:
+    """As diferenças de ritmo entre compostos desta corrida, do mais rápido ao mais lento, só as
+    medidas DENTRO do piloto em pelo menos MIN_PAIRS pilotos (as das médias não entram)."""
+    found = (pace.offset(a, b) for a, b in _FASTER_TO_SLOWER)
+    return tuple(
+        o.delta for o in found if o is not None and o.source == "pares" and o.n_pairs >= MIN_PAIRS
+    )
+
+
 def compute_race_stats(ref: RaceRef, rows: Sequence[LapRow]) -> RaceStats:
     """As constantes que esta corrida, vista inteira, daria. Usa o `k` da variante encolhimento."""
-    model = fit_degradation(
+    pace = fit_pace(
         rows, upto_lap=ref.total_laps, total_laps=ref.total_laps, variant=FuelVariant.ENCOLHIMENTO
     )
+    model = pace.degradation
     stops = find_pit_stops(rows, kappa=model.fuel.kappa, upto_lap=ref.total_laps)
     green = np.array([s.loss for s in stops if s.green])
     other = tuple(s.loss for s in stops if not s.green)
@@ -71,6 +84,7 @@ def compute_race_stats(ref: RaceRef, rows: Sequence[LapRow]) -> RaceStats:
         n_green_stops=len(green),
         green_losses=tuple(float(x) for x in green),
         other_losses=other,
+        offsets=_pair_offsets(pace),
     )
 
 
@@ -130,6 +144,16 @@ def _summary(stats: Sequence[RaceStats]) -> list[str]:
     few = [s.label for s in stats if s.n_green_stops < 10]
     green_all = [x for s in stats for x in s.green_losses]
     other_all = [x for s in stats for x in s.other_losses]
+    offsets = [x for st in stats for x in st.offsets]
+    offset_line = (
+        f"- Diferença de ritmo entre compostos medida dentro do piloto ({len(offsets)} "
+        "diferenças, uma "
+        f"por par de compostos e corrida): mediana {median(offsets):+.2f} s, desvio ENTRE corridas "
+        f"{_MAD_TO_SD * median(abs(v - median(offsets)) for v in offsets):.2f} s, bem maior que o "
+        "erro-padrão de cada uma (0,05 a 0,17 s): é o viés por corrida que o erro-padrão não vê."
+        if len(offsets) >= 2
+        else "- Sem diferenças de ritmo entre compostos medidas dentro do piloto."
+    )
     other_line = (
         f"- Paradas FORA da bandeira verde (safety car, VSC, vermelha, amarela): {len(other_all)}, "
         f"mediana {median(other_all):.1f} s contra {median(green_all):.1f} s das verdes. "
@@ -146,6 +170,7 @@ def _summary(stats: Sequence[RaceStats]) -> list[str]:
         f"{max(losses):.1f}; a variação ENTRE corridas (desvio robusto) é {between_sd:.1f} s e a "
         f"dispersão entre paradas dentro de uma corrida, em mediana, {median(sds):.1f} s.",
         other_line,
+        offset_line,
         f"- Com menos de 10 paradas verdes: {', '.join(few) if few else 'nenhuma corrida'}. "
         "É nelas "
         "que o prior pesa.",
@@ -153,7 +178,8 @@ def _summary(stats: Sequence[RaceStats]) -> list[str]:
         f"{median(betweens):.3f}.",
         f"- Valores de `DEFAULT_PRIORS` (todas as corridas dentro): perda {d.pit_loss.mean:.1f} s, "
         f"variação entre corridas {d.pit_loss.between_sd:.1f} s, dispersão entre paradas "
-        f"{d.pit_loss.stop_sd:.1f} s, τ {d.tau}, piso entre compostos {d.between_compounds}.",
+        f"{d.pit_loss.stop_sd:.1f} s, τ {d.tau}, piso entre compostos {d.between_compounds}, "
+        f"espalhamento entre corridas da diferença de compostos {d.offset_sd}.",
     ]
 
 

@@ -184,3 +184,39 @@ def test_a_previous_edition_without_a_measured_loss_is_not_history():
     stats = [stat("2023", year=2023, pit_loss=None), stat("2024", year=2024)]
 
     assert circuit_history(stats, "2024") == []
+
+
+# ------------------------------------------------------------------ o espalhamento entre corridas
+
+
+def with_offsets(label, round_, offsets):
+    return stat(label, round_=round_, circuit=f"C{round_}", offsets=tuple(offsets))
+
+
+def test_the_offset_spread_is_measured_between_the_other_races():
+    stats = [with_offsets(f"R{i}", i, (-0.5 * i, 0.5 * i, 0.0)) for i in range(1, 6)]
+
+    spread = leave_one_out(stats, "R3").offset_sd
+
+    assert spread > 0.1  # espalhamento real entre as corridas de referência
+    assert spread != DEFAULT_PRIORS.offset_sd
+
+
+def test_the_excluded_race_does_not_set_its_own_offset_spread():
+    stats = [with_offsets(f"R{i}", i, (0.1 * i, -0.1 * i, 0.0)) for i in range(1, 6)]
+    honest = leave_one_out(stats, "R3")
+    stats[2] = replace(stats[2], offsets=(50.0, -50.0, 40.0))
+
+    assert leave_one_out(stats, "R3").offset_sd == honest.offset_sd
+
+
+def test_with_too_few_reference_offsets_the_default_spread_applies():
+    stats = [with_offsets(f"R{i}", i, (0.2,)) for i in range(1, 5)]
+
+    assert leave_one_out(stats, "R1").offset_sd == DEFAULT_PRIORS.offset_sd
+
+
+def test_the_offset_spread_never_goes_below_its_floor():
+    flat = [with_offsets(f"R{i}", i, (0.2, 0.2, 0.2)) for i in range(1, 6)]
+
+    assert leave_one_out(flat, "R1").offset_sd == pytest.approx(0.1)

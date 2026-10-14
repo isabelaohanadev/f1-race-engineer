@@ -602,6 +602,7 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Degradação por composto e por piloto, com encolhimento e três incertezas separadas** | Um piloto com 8 voltas num composto tem uma inclinação de erro enorme; a média do composto na corrida (de ~20 pilotos) é estável, mas não é "dele". O encolhimento normal-normal pesa as duas pela precisão (`B = t²/(t²+se²)`): com pouco dado vale o composto, com muito vale o piloto. As incertezas saem separadas: `se` (do parâmetro, cai com dados), `σ` (ruído de UMA volta, não cai) e `τ` (variação real da inclinação entre pilotos/stints, estimada pelos próprios dados). Para prever um stint **futuro** vale `sqrt(se² + τ²)`; só com `se` o alerta de undercut ficaria confiante demais. |
 | **Perda no pit medida na própria corrida, só em bandeira verde** | `perda = (volta de entrada + de saída) - 2 x ritmo normal`, com o ritmo normal a média da mediana das voltas limpas antes e depois (a janela simétrica cancela a tendência do combustível: a perda sai a mesma com o `k` certo ou errado, testado). Paradas sob SC/VSC/vermelha ficam fora da estimativa. Devolve a mediana e a dispersão **entre paradas** (o `sd` que importa na margem: atacante e rival pagam paradas independentes e o erro da mediana é o mesmo para os dois). Com poucas paradas encolhe para o prior. |
 | **Constantes que saem dos dados, calculadas sem a corrida avaliada** | `TAU_FALLBACK`, o piso entre compostos e a reserva da perda no pit viram um `Priors`, recalculado por `leave_one_out` deixando a corrida de fora (testado: trocar os números dela por absurdos não muda a constante dela). `earlier_only=True` usa só corridas anteriores no calendário, o que se saberia ao vivo. O padrão (`DEFAULT_PRIORS`) tem as 21 corridas dentro e **não serve a backtest**. |
+| **Nível de ritmo por stint, e a diferença entre compostos medida DENTRO do piloto** | A degradação só tem inclinações; para comparar pneu novo com gasto falta o nível. O nível é o tempo corrigido na idade zero, por stint, encolhido para a média do composto (com a variância do próprio stint moderada: um stint de 4 voltas ruidosas não manda sozinho). O nível de um piloto num composto que ele ainda não usou NÃO é a média desse composto (mistura pilotos rápidos e lentos, e no teste errava mais de 0,8 s): é o nível dele no composto atual mais a diferença entre os dois compostos, medida nos pilotos que rodaram os dois, onde o ritmo de cada um se cancela. Entre atacante e rival conta a **diferença**, e a evolução da pista aparece nos dois e se cancela (testado: com `k` de 0,05 ou 0,12 a diferença prevista entre dois carros muda menos de 0,08 s, e o tempo absoluto muda mais de 0,2 s). |
 | **Huber + erro-padrão por cluster de piloto, em numpy puro** | As voltas de um piloto não são independentes: o erro-padrão clássico trata ~1.000 voltas como 1.000 observações e sai pequeno demais, e é ele que decide se o estimado vale. Calibrado em simulação (cobertura de 93 a 96% para um intervalo de 95%); o teste de calibração pegou dois erros meus (o "pão" do sanduíche de Huber e a normal otimista para 20 clusters). Sem statsmodels: são ~60 linhas. |
 | **A "verdade" do backtest é a ordem na pista; o oficial é reportado ao lado** | O modelo simula a pista; desqualificações e acréscimos de tempo pós-bandeira não são previsíveis. Na Bélgica o Russell venceu na pista e foi desqualificado depois. Em 23 das 24 corridas de 2024 o vencedor é o mesmo nas duas ordens, e o pódio difere em 2 (`docs/verdade-do-backtest.md`). |
 | **Backtest principal só com corridas secas; as demais à parte** | Em pista molhada, ou que seca durante a corrida, o tempo cai por causa da pista e o modelo "descobre" degradação negativa: medir o erro nelas mediria o clima. O principal usa as 21 corridas com 99% ou mais das voltas em pneu de seco. A **corrida britânica** (76% seca, pista secando) é a que mais tentaria entrar por engano e fica à parte, junto com o Canadá e o Brasil (molhadas). |
@@ -702,6 +703,24 @@ Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
   paradas fora da estimativa verde.
 
 
+#### O nível de ritmo: o que medi, e o que não funcionou como eu esperava
+
+- **A diferença de ritmo entre compostos é fraca nestes dados, e varia entre corridas.** Medida dentro
+  do piloto (idade zero), MEDIUM para HARD tem mediana **+0,13 s** e só 12 de 20 corridas positivas (de
+  -0,64 a +0,73); SOFT para MEDIUM, mediana 0,00. O esperado, HARD claramente mais lento que MEDIUM,
+  **não apareceu**. Uma checagem pontual, **fora do repositório**, com um estimador que não usa o `k`
+  (efeito fixo de piloto e de volta: compara carros na MESMA volta) deu o mesmo quadro (mediana +0,03 s,
+  13 de 20 positivas), então não é um erro de sinal do estimador: em ritmo de corrida, a idade igual,
+  os pilotos gerenciam o pneu e a diferença some no ruído.
+- **O erro-padrão de cada diferença (0,05 a 0,17 s) subestima o que importa.** Entre corridas as
+  diferenças se espalham com desvio robusto **0,46 s** (36 diferenças). Esse espalhamento entra na
+  incerteza da diferença (`Priors.offset_sd`, calculado sem a corrida avaliada), porque a margem do
+  undercut depende dela diretamente.
+- **Consequência esperada:** a diferença entre o pneu novo e o gasto tem mais incerteza do que a
+  degradação sozinha sugere, e o undercut vai alertar menos. Se o backtest mostrar que essa incerteza
+  é o gargalo, o caminho é um modelo de ritmo com efeito fixo de volta (não depende do `k`), que não
+  fiz.
+
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
 
@@ -797,6 +816,9 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   t de Student), e o Huber, com tão poucas voltas, pode tratar como outlier uma volta que é só ruído.
 - **O caminho "mesmo circuito, edições anteriores" da perda no pit não foi validado com dados
   reais**: o banco só tem 2024 (ver acima).
+- **O nível de ritmo de um composto novo depende de uma diferença entre compostos pouco identificada**
+  (ver acima), e o nível "atual" de um piloto que acabou de parar é o do stint anterior até o novo ter
+  3 voltas limpas: quem usa confere o número do stint.
 - **0,03 s/kg não foi validado de forma independente.** É uma suposição de engenharia; os dados só
   dizem que o `k` total (combustível + pista) é parecido com ele em 20 de 21 corridas, o que não
   prova que o combustível sozinho vale isso.
@@ -840,7 +862,7 @@ app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, ro
 replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
-strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit (puro)
+strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

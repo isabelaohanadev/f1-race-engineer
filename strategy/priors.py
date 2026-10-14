@@ -33,6 +33,8 @@ from strategy.pitloss import PitLossPrior
 MIN_RACES = 3  # com menos corridas de referência, a constante não é estimada: vale o padrão
 _MAD_TO_SD = 1.4826
 PIT_LOSS_BETWEEN_FLOOR = 0.5  # s
+OFFSET_SD_FLOOR = 0.1  # s
+MIN_OFFSETS = 6  # com menos diferenças de referência, vale o padrão
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,9 @@ class Priors:
     tau: float  # s por volta de idade: variação entre pilotos/stints
     between_compounds: float  # s por volta de idade: piso da diferença entre compostos
     pit_loss: PitLossPrior
+    # O quanto a diferença de ritmo entre compostos (medida dentro do piloto) varia ENTRE corridas,
+    # em s: o viés por corrida que o erro-padrão de cada uma não vê. Entra na incerteza do undercut.
+    offset_sd: float
     source: str  # de onde vêm, para ninguém usar as erradas sem saber
 
 
@@ -48,6 +53,7 @@ DEFAULT_PRIORS = Priors(
     tau=0.022,
     between_compounds=0.017,
     pit_loss=PitLossPrior(mean=22.5, between_sd=2.1, stop_sd=1.4),
+    offset_sd=0.46,
     source="padrão: 21 corridas de 2024, INCLUSIVE a avaliada (não use em backtest)",
 )
 
@@ -68,6 +74,9 @@ class RaceStats:
     # As perdas de cada parada (verdes e as demais), só para o relatório comparar uma com a outra.
     green_losses: tuple[float, ...] = ()
     other_losses: tuple[float, ...] = ()
+    # As diferenças de ritmo entre compostos (do mais rápido ao mais lento) medidas dentro do
+    # piloto.
+    offsets: tuple[float, ...] = ()
 
 
 def _robust_sd(values: Sequence[float], floor: float) -> float:
@@ -128,6 +137,12 @@ def leave_one_out(
         ),
         stop_sd=_median_or(stop_sds, default.pit_loss.stop_sd),
     )
+    pooled_offsets = [x for s in others for x in s.offsets]
+    offset_sd = (
+        _robust_sd(pooled_offsets, OFFSET_SD_FLOOR)
+        if len(pooled_offsets) >= MIN_OFFSETS
+        else default.offset_sd
+    )
     n = len(others)
     where = "só anteriores" if earlier_only else "todas as outras"
     circuit = f", centro do circuito ({len(history)} edições anteriores)" if history else ""
@@ -137,5 +152,6 @@ def leave_one_out(
             [s.between_compounds for s in others], default.between_compounds
         ),
         pit_loss=prior,
+        offset_sd=offset_sd,
         source=f"sem {exclude}: {n} corridas ({where}){circuit}",
     )

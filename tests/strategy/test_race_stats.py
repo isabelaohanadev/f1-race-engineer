@@ -141,3 +141,18 @@ def test_main_prints_and_writes_the_markdown_file(monkeypatch, capsys, tmp_path)
 
     assert "R3" in capsys.readouterr().out
     assert "| R3 |" in target.read_text(encoding="utf-8")
+
+
+def test_a_race_reports_the_compound_offsets_measured_inside_the_drivers():
+    stats = compute_race_stats(REF, synthetic_race())
+
+    assert stats.offsets  # há pilotos suficientes com SOFT/MEDIUM e HARD
+    assert all(isinstance(x, float) for x in stats.offsets)
+
+
+def test_the_summary_reports_the_between_race_spread_of_the_offsets():
+    stats = [replace(s, offsets=(0.5, -0.5, 0.1)) for s in stats_list()]
+
+    text = race_stats.build_report(stats, markdown=False)
+
+    assert "15 diferenças" in text and "desvio ENTRE corridas" in text

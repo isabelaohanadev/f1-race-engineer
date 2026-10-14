@@ -7,9 +7,10 @@ Gerado por `python -m strategy.race_stats --markdown docs/perda-no-pit.md` em 20
 - 21 corridas; 511 paradas em bandeira verde.
 - Perda no pit (mediana por corrida): mediana 22.5 s, de 18.8 a 29.8; a variação ENTRE corridas (desvio robusto) é 2.1 s e a dispersão entre paradas dentro de uma corrida, em mediana, 1.4 s.
 - Paradas FORA da bandeira verde (safety car, VSC, vermelha, amarela): 24, mediana 30.2 s contra 22.7 s das verdes. Não saíram mais baratas; ver a nota abaixo sobre por que isso não responde à pergunta.
+- Diferença de ritmo entre compostos medida dentro do piloto (36 diferenças, uma por par de compostos e corrida): mediana +0.03 s, desvio ENTRE corridas 0.46 s, bem maior que o erro-padrão de cada uma (0,05 a 0,17 s): é o viés por corrida que o erro-padrão não vê.
 - Com menos de 10 paradas verdes: 2024 R02 Saudi Arabian, 2024 R08 Monaco, 2024 R23 Qatar. É nelas que o prior pesa.
 - τ mediano 0.022; diferença entre compostos mediana 0.017.
-- Valores de `DEFAULT_PRIORS` (todas as corridas dentro): perda 22.5 s, variação entre corridas 2.1 s, dispersão entre paradas 1.4 s, τ 0.022, piso entre compostos 0.017.
+- Valores de `DEFAULT_PRIORS` (todas as corridas dentro): perda 22.5 s, variação entre corridas 2.1 s, dispersão entre paradas 1.4 s, τ 0.022, piso entre compostos 0.017, espalhamento entre corridas da diferença de compostos 0.46.
 
 ## Como ler
 
