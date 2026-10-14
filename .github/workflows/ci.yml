@@ -36,7 +36,7 @@ jobs:
         run: ruff format --check .
 
   test:
-    name: Testes (unitários + integração com TimescaleDB)
+    name: Testes (unitários + integração com TimescaleDB e Redis)
     needs: lint # só roda se o lint passou
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -61,14 +61,31 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
+      # Redis real como service container (Fase 2: Streams + consumer groups). A MESMA versão do
+      # docker-compose.yml: mantenha as duas em sincronia. Sem AOF nem limite de memória: aqui o
+      # Redis é descartável, vive só durante o job.
+      redis:
+        image: redis:8.6.7-alpine
+        ports:
+          - 6379:6379
+        # O job só começa com o Redis respondendo PONG (mesmo healthcheck do compose).
+        options: >-
+          --health-cmd "redis-cli ping | grep -q PONG"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     env:
       POSTGRES_HOST: localhost
       POSTGRES_PORT: "5432"
       POSTGRES_USER: f1
       POSTGRES_PASSWORD: ci_password
       POSTGRES_DB: f1_race_engineer
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
       # Os testes de integração NUNCA podem ser pulados em silêncio no CI: com esta variável, "banco
-      # inacessível" ou "senha ausente" vira FALHA em vez de skip (ver tests/integration/conftest.py).
+      # ou Redis inacessível" ou "senha ausente" vira FALHA em vez de skip (ver
+      # tests/integration/conftest.py).
       REQUIRE_INTEGRATION_DB: "1"
 
     steps:
@@ -83,7 +100,7 @@ jobs:
       # Separados para o log mostrar qual camada quebrou: rápidos e sem banco primeiro.
       - name: Testes unitários (sem banco)
         run: pytest -m "not integration"
-      - name: Testes de integração (TimescaleDB real)
+      - name: Testes de integração (TimescaleDB e Redis reais)
         # -ra lista o motivo de qualquer skip/xfail no resumo. Se nenhum teste for coletado o
         # pytest sai com código 5 e o passo falha (não passa "vazio").
         run: pytest -m integration -ra

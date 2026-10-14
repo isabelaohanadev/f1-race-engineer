@@ -8,9 +8,10 @@ x-postgres-env: &postgres-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-f1_dev_password}
   POSTGRES_DB: ${POSTGRES_DB:-f1_race_engineer}
 
-# Base comum de tudo que roda o código do projeto (app agora; migrate e, na Fase 2, workers).
+# Base comum do que roda o código do projeto E precisa do banco (app e migrate). O worker usa a
+# mesma imagem mas NÃO esta base: ele só fala com o Redis e não recebe a senha do Postgres.
 # A mesma `image:` nos dois serviços faz ambos usarem a MESMA imagem; o segundo build é só
-# cache hit. O banco é alcançado pelo nome do serviço (db) e pela porta interna (5432).
+# cache hit. Banco e Redis são alcançados pelo nome do serviço (db, redis) e pela porta interna.
 x-app-base: &app-base
   build: .
   image: f1-race-engineer:local
@@ -18,6 +19,8 @@ x-app-base: &app-base
     <<: *postgres-env
     POSTGRES_HOST: db
     POSTGRES_PORT: "5432"
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
     FASTF1_CACHE_DIR: /cache/fastf1
 
 services:
@@ -42,6 +45,46 @@ services:
       # TEMPORÁRIO (só socket Unix) para os scripts de init. Sem -h, o pg_isready acharia que o
       # banco está pronto cedo demais e o `migrate` (que conecta por TCP) falharia na 1ª subida.
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Redis é o "barramento" da Fase 2: o motor de replay publica eventos num Stream, os workers
+  # consomem por consumer group e a API entrega por WebSocket. Os dados de verdade continuam no
+  # Postgres: o que está aqui é derivado e pode ser regenerado reiniciando o replay.
+  redis:
+    # Versão FIXADA (não `latest`), mesma lógica do Timescale. Alpine: imagem pequena. Mantenha em
+    # sincronia com o service container do .github/workflows/ci.yml.
+    image: redis:8.6.7-alpine
+    restart: unless-stopped
+    # Flags (o ENTRYPOINT da imagem passa o comando ao redis-server):
+    #  --appendonly yes: grava cada escrita num log (AOF, fsync a cada 1 s). Se o Redis reiniciar no
+    #    meio da corrida, o stream e os consumer groups voltam como estavam: os workers só
+    #    reconectam. Sem isso, um restart apagaria tudo e o replay teria de recomeçar.
+    #  --maxmemory 256mb + noeviction: com a política padrão de despejo (allkeys-lru, em vários
+    #    ambientes) o Redis poderia APAGAR O STREAM em silêncio quando a memória enche. Com
+    #    `noeviction` ele recusa novas escritas (erro OOM), que o publisher vê e trata. A memória
+    #    fica limitada de verdade porque o stream também é aparado (MAXLEN) ao publicar.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      # Só em 127.0.0.1: este Redis não tem senha, então NÃO pode ficar exposto à rede (o padrão do
+      # Docker seria 0.0.0.0, o clássico Redis aberto na internet). Dentro da rede do compose os
+      # outros serviços o acessam por redis:6379 sem depender desta publicação.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      # `| grep -q PONG`: só um PONG de verdade significa "pronto para receber comandos". Enquanto
+      # carrega o AOF no boot o Redis responde ao PING com um erro (LOADING), e o grep não depende
+      # de como o redis-cli traduz uma resposta de erro em código de saída.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -73,6 +116,11 @@ services:
       migrate:
         # ...e depois que o schema foi criado/atualizado com sucesso.
         condition: service_completed_successfully
+      redis:
+        # O WebSocket e os endpoints de replay (próximas etapas) precisam do Redis. O depends_on só
+        # ordena a SUBIDA: se o Redis cair depois, o app continua de pé (as rotas REST seguem
+        # funcionando) e o código reconecta sozinho.
+        condition: service_healthy
     healthcheck:
       # A imagem slim não tem curl; usamos o próprio Python. O /health devolve 503 quando o banco
       # cai, e o urlopen levanta exceção em 4xx/5xx: o container fica "unhealthy" no
@@ -87,6 +135,35 @@ services:
       retries: 5
       start_period: 10s
 
+  # Worker consumidor da Fase 2: lê o stream da corrida por consumer group e mantém o estado atual
+  # no Redis (replay/state.py). Escala com `docker compose up -d --scale worker=3`: todas as cópias
+  # entram no MESMO grupo e o Redis reparte as entradas entre elas. Seguro por construção: a
+  # atualização é idempotente e à prova de ordem (Lua), e as pendências de uma cópia que morre são
+  # resgatadas pelas outras (XAUTOCLAIM).
+  worker:
+    image: f1-race-engineer:local
+    build: .
+    command: ["python", "-m", "worker"]
+    restart: unless-stopped
+    environment:
+      # Só o Redis: sem credenciais do Postgres (menor privilégio).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # O worker é um processo à parte da API: expõe o SEU /metrics, nesta porta (0 desliga).
+      WORKER_METRICS_PORT: "9108"
+    ports:
+      # Porta do HOST efêmera (sorteada pelo Docker) e só em loopback: com `--scale worker=N` uma
+      # porta fixa daria conflito. Para achar a da cópia 1: `docker compose port --index 1 worker 9108`.
+      # Dentro da rede do Compose o Prometheus raspa `worker:9108` (DNS devolve todas as cópias).
+      - "127.0.0.1::9108"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # O worker trata SIGTERM terminando o lote em andamento; 15 s é folga de sobra sobre os ~1 s
+    # do BLOCK do XREADGROUP.
+    stop_grace_period: 15s
+
 volumes:
   pgdata:
+  redisdata:
   fastf1_cache:

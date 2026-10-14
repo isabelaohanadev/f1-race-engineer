@@ -1,19 +1,155 @@
 # F1 Race Engineer
 
-Pipeline de dados de Fórmula 1: baixa uma corrida pelo [FastF1](https://github.com/theOehrly/Fast-F1),
-grava pilotos, equipes, voltas e a **telemetria de posição (x, y)** num TimescaleDB e serve tudo
-por uma API REST.
+[![CI](https://github.com/isabelaohanadev/f1-race-engineer/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/isabelaohanadev/f1-race-engineer/actions/workflows/ci.yml)
 
-Com o GP do Brasil 2024 de exemplo: **797.642 amostras de posição** (~75 MB com índices),
-1.134 voltas e 20 pilotos entram no banco em cerca de 1 minuto, e rodar a ingestão de novo
-**não altera nenhuma linha**.
+Pipeline de dados de Fórmula 1 com **replay de corrida em tempo real**. Baixa uma corrida pelo
+[FastF1](https://github.com/theOehrly/Fast-F1), grava pilotos, equipes, voltas e a **telemetria de
+posição (x, y)** num TimescaleDB, serve tudo por uma API REST e **reproduz a corrida gravada como se
+fosse ao vivo**: um motor de replay publica eventos em Redis Streams, workers mantêm o estado atual
+da corrida e clientes WebSocket recebem um snapshot e, em seguida, os eventos em tempo real.
+
+Com o GP do Brasil 2024 de exemplo: **797.642 amostras de posição** (~75 MB com índices), 1.134
+voltas e 20 pilotos entram no banco em cerca de 1 minuto (e reingerir **não altera nenhuma linha**).
+O replay lê essas 797 mil linhas com **~4 MB de memória** (em vez de ~270 MB) e entrega eventos ao
+cliente com latência de poucos milissegundos.
 
 > Projeto independente de portfólio. Sem vínculo com a Formula 1; usa dados públicos via FastF1.
 
-**Stack:** Python 3.12 · FastAPI · SQLAlchemy 2.0 + Alembic · PostgreSQL 16 + TimescaleDB ·
-FastF1 · pytest · Docker Compose · GitHub Actions
+**Stack:** Python 3.12 · FastAPI (REST + WebSocket) · SQLAlchemy 2.0 + Alembic · PostgreSQL 16 +
+TimescaleDB · Redis 8 (Streams, consumer groups, Lua) · Prometheus · FastF1 · pytest · Docker
+Compose · GitHub Actions
 
 ## Arquitetura
+
+### O fluxo completo
+
+```mermaid
+flowchart LR
+    DB[("TimescaleDB<br/>position_samples (hypertable)<br/>laps, races, drivers...")]
+
+    subgraph API1 ["API: instância dona do replay"]
+        direction TB
+        SRC["RaceSource<br/>leitura por keyset (time, driver_id)<br/>páginas de 5.000 + prefetch"]
+        ENG["ReplayEngine<br/>ritmo por âncora monotônica<br/>1x, 4x, 16x e pausa"]
+        PUB["StreamPublisher<br/>XADD MAXLEN ~ 100.000<br/>lotes em MULTI/EXEC"]
+        SRC --> ENG --> PUB
+    end
+
+    subgraph REDIS ["Redis"]
+        direction TB
+        STREAM[/"Stream race:ano:etapa<br/>toda entrada leva o epoch do replay"/]
+        STATE[("Hash state:ano:etapa<br/>VER:x, VER:lap, race:lap ...")]
+        CTL[("Plano de controle<br/>status, comandos e lock do replay")]
+    end
+
+    subgraph WORKERS ["Workers: N cópias no grupo compartilhado state-workers"]
+        direction TB
+        W["XREADGROUP, script Lua, XACK<br/>o Lua só grava se a versão for maior<br/>XAUTOCLAIM resgata pendências"]
+    end
+
+    subgraph API2 ["Qualquer instância da API"]
+        direction TB
+        HUB["Hub por corrida<br/>XREAD sem grupo"]
+        FILA["Fila limitada por cliente<br/>cheia: fecha com 1013"]
+        WS["WebSocket<br/>/ws/races/ano/etapa"]
+        HUB --> FILA --> WS
+    end
+
+    DB --> SRC
+    PUB --> STREAM
+    PUB -.->|"DEL do stream e lock"| CTL
+    STREAM --> W
+    W --> STATE
+    STREAM --> HUB
+    STATE -->|"snapshot e marca d'água"| WS
+    STREAM -->|"catch-up com XRANGE"| WS
+    WS --> CLI(["cliente<br/>navegador, websocat ou script"])
+```
+
+Duas ideias sustentam o desenho. **O estado mora no Redis**, não na memória de um worker: assim
+vários workers dividem a carga e qualquer instância da API consegue montar um snapshot.
+**A consistência vem do dado, não da ordem**: cada atualização carrega uma versão (o tempo de
+corrida) e um *epoch* (o número do replay), então o resultado final é o mesmo qualquer que seja a
+ordem em que os workers processem os eventos, e reprocessar um evento é inofensivo.
+
+### Como um cliente entra no meio do replay, sem buracos
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Cliente
+    participant A as API com WebSocket e hub
+    participant R as Redis
+    participant W as Workers
+
+    Note over W,R: continuamente: XREADGROUP, script Lua, XACK
+    C->>A: conecta em /ws/races/2024/21
+    A->>A: inscreve a fila do cliente no hub e anota join_id
+    A->>R: marca d'água: XINFO GROUPS e XPENDING
+    R-->>A: ID até o qual tudo já foi aplicado ao estado
+    A->>R: snapshot: HGETALL do hash de estado
+    R-->>A: estado consistente, lido por um único comando
+    A-->>C: frame snapshot com as_of igual à marca d'água
+    A->>R: catch-up: XRANGE da marca d'água até join_id
+    R-->>A: eventos que o snapshot pode não ter
+    A-->>C: eventos do catch-up (podem repetir, é inofensivo)
+    loop ao vivo
+        R-->>A: XREAD do hub, sem consumer group
+        A-->>C: evento da fila do cliente
+    end
+    Note over C,A: se a fila do cliente enche, o servidor fecha com 1013 e ele reconecta
+```
+
+O ponto sutil é o passo 3. A receita "anotar o último ID do stream, ler o snapshot e seguir o
+stream dali" tem um **buraco**: o worker aplica o evento *depois* de ele ser publicado, então os
+eventos já publicados e ainda não aplicados não estão no snapshot, e o `XREAD` só traz o que vem
+depois do ID anotado. Por isso o ponto de partida é a **marca d'água**: o ID até o qual tudo já foi
+*aplicado* (o menor pendente do grupo menos 1, ou o último entregue). O que está entre a marca
+d'água e `join_id` vem do próprio stream (catch-up), e o que vem depois de `join_id` vem da fila do
+cliente. Eventos podem chegar repetidos; como a atualização é idempotente, isso não faz mal.
+
+### Controle do replay entre processos
+
+O motor roda na instância da API que recebeu o `start`, mas qualquer instância controla o replay:
+
+```mermaid
+sequenceDiagram
+    participant U as Cliente HTTP
+    participant B as API instância B
+    participant R as Redis
+    participant A as API instância A, dona do replay
+
+    U->>B: POST /replay/2024/21/pause
+    B->>R: lê replay:status, o replay existe e está ativo?
+    B->>R: XADD replay:ctl com o comando pause
+    A->>R: XREAD BLOCK em replay:ctl
+    R-->>A: comando pause
+    A->>A: pausa o motor, o tempo de corrida congela
+    A->>R: LPUSH da resposta e atualiza replay:status
+    B->>R: BLPOP da resposta, até 2 s
+    R-->>B: status novo
+    B-->>U: 200 com o status
+```
+
+O status é um hash com TTL de 10 s que o dono renova a cada ~1 s: se o dono morre, o status expira
+sozinho e o replay deixa de aparecer como ativo. Um lock no Redis garante **um replay por corrida**
+mesmo com várias instâncias (o segundo `start` recebe `409`).
+
+### O que sobe com `docker compose up`
+
+```mermaid
+flowchart LR
+    DB["db<br/>TimescaleDB 2.30.2"] -- "healthy" --> MIG["migrate<br/>alembic upgrade head<br/>(roda e termina)"]
+    MIG -- "terminou com sucesso" --> APP["app<br/>uvicorn :8000<br/>REST, WebSocket e /metrics"]
+    RED["redis<br/>Redis 8.6.7<br/>127.0.0.1:6379"] -- "healthy" --> APP
+    RED -- "healthy" --> WRK["worker (N cópias)<br/>python -m worker<br/>/metrics :9108"]
+```
+
+A migration é um **job separado** (e não parte do startup do app) para que, com várias réplicas,
+ela rode exatamente uma vez por `up` em vez de várias disputando o mesmo schema. O worker recebe só
+as variáveis do Redis: não tem a senha do Postgres.
+
+### Ingestão (Fase 1)
 
 ```mermaid
 flowchart LR
@@ -33,7 +169,7 @@ flowchart LR
         H[("position_samples<br/>HYPERTABLE, chunk de 7 dias")]
     end
 
-    API["FastAPI<br/>GET /races/year/round/laps<br/>GET /health"]
+    API["FastAPI<br/>GET /races/year/round/laps"]
     CLI(["curl / cliente HTTP"])
 
     F1 --> CACHE --> L
@@ -46,17 +182,6 @@ flowchart LR
 O `loader` é a única parte que conhece o FastF1 e devolve dataclasses com tipos nativos do Python.
 O `writer` só conhece essas dataclasses e o banco. Essa fronteira é o que deixa o `writer`
 testável sem rede e permite trocar a fonte de dados sem tocar na gravação.
-
-### O que sobe com `docker compose up`
-
-```mermaid
-flowchart LR
-    DB["db<br/>TimescaleDB 2.30.2"] -- "healthy" --> MIG["migrate<br/>alembic upgrade head<br/>(roda e termina)"]
-    MIG -- "terminou com sucesso" --> APP["app<br/>uvicorn :8000"]
-```
-
-A migration é um **job separado** (e não parte do startup do app) para que, com várias réplicas,
-ela rode exatamente uma vez por `up` em vez de várias disputando o mesmo schema.
 
 ### Modelo de dados
 
@@ -115,53 +240,128 @@ erDiagram
     }
 ```
 
-## Como rodar
+## Como rodar do zero
 
-### Com Docker (recomendado)
+Precisa de **Docker** (Compose v2) e, para o script de exemplo e os testes, **Python 3.12+**.
+
+### 1. Configuração (`.env`)
 
 ```bash
-cp .env.example .env              # opcional: tudo tem default de desenvolvimento
-docker compose up --build -d      # sobe banco, aplica as migrations e sobe a API
+cp .env.example .env
+```
 
-# Ingere o GP do Brasil 2024 (2024, etapa 21). A 1ª vez baixa os dados (~1 min ou mais);
-# as seguintes reaproveitam o cache.
-docker compose run --rm app python -m ingestion --year 2024 --round 21
+**Se você já tem um PostgreSQL rodando na máquina** (comum no macOS e no Windows), a porta 5432 está
+ocupada e o `docker compose up` falha com `ports are not available ... 5432 ... address already in
+use`. Mude a porta **publicada no host** antes da primeira subida:
 
+```bash
+sed -i.bak 's/^POSTGRES_PORT=.*/POSTGRES_PORT=55432/' .env      # ou edite o .env à mão
+```
+
+Isso só muda a porta que o *seu computador* enxerga (para `psql`, DBeaver, os testes e a ingestão
+fora do Docker). Dentro da rede do Compose o app continua falando com `db:5432`. Trocar a porta
+depois de o banco já ter subido recria o container `db`, mas os dados ficam: vivem no volume
+`pgdata`. O mesmo vale para `REDIS_PORT` (6379) e `APP_PORT` (8000).
+
+### 2. Subir tudo
+
+```bash
+docker compose up --build -d --scale worker=2    # banco, migrations, API, Redis e 2 workers
 curl -s localhost:8000/health
-curl -s "localhost:8000/races/2024/21/laps?driver=VER" | head -c 600
+# {"status":"ok","checks":{"process":"ok","database":"ok","redis":"ok"}}
 ```
 
 Documentação interativa (Swagger) em <http://localhost:8000/docs>.
 
-Se a porta 5432 ou a 8000 já estiverem ocupadas na sua máquina, defina `POSTGRES_PORT` e/ou
-`APP_PORT` no `.env` (por exemplo `POSTGRES_PORT=55432`). Elas só mudam a porta **publicada no
-host**; dentro da rede do Compose o app sempre fala com `db:5432`.
+### 3. Ingerir uma corrida
+
+```bash
+# GP do Brasil 2024 (2024, etapa 21). A 1ª vez baixa os dados (~1 min ou mais); as seguintes
+# reaproveitam o cache.
+docker compose run --rm app python -m ingestion --year 2024 --round 21
+curl -s "localhost:8000/races/2024/21/laps?driver=VER" | head -c 600
+```
+
+### 4. Iniciar o replay e assistir
+
+```bash
+# 16x: o GP gravado tem ~3 h de dados (a largada foi bem depois do início), então a 16x leva ~12 min
+curl -X POST localhost:8000/replay/2024/21/start -H 'content-type: application/json' -d '{"speed": 16}'
+```
+
+Três formas de ver o stream (as duas primeiras imprimem o snapshot e depois os eventos):
+
+```bash
+# a) com websocat (https://github.com/vi/websocat)
+websocat ws://localhost:8000/ws/races/2024/21 | head -n 20
+
+# b) com o script Python (precisa de `pip install websockets`, que já vem com uvicorn[standard])
+python scripts/watch_race.py --year 2024 --round 21            # resumo a cada segundo
+python scripts/watch_race.py --year 2024 --round 21 --events   # cada evento (muito volume)
+```
+
+```text
+c) no navegador: http://localhost:8000/frontend/
+```
+
+A página (`frontend/`, HTML e JS puros, sem build, servida pela própria API) conecta sozinha, mostra
+o snapshot, os contadores, a classificação ao vivo e o log de eventos, e tem botões para iniciar,
+pausar, retomar, mudar a velocidade e parar o replay. Os eventos de posição (~99% do volume) só vão
+para o log se você marcar a opção, senão a tela seria ilegível a 16x.
+
+O `scripts/watch_race.py` é também um **cliente de referência**: a classe `RaceView` implementa, em
+~40 linhas, as regras do protocolo (ver abaixo) e é a mesma que os testes validam.
+
+### 5. Controlar o replay (de qualquer instância da API)
+
+```bash
+curl -X POST localhost:8000/replay/2024/21/pause
+curl -X POST localhost:8000/replay/2024/21/speed -H 'content-type: application/json' -d '{"speed": 4}'
+curl -X POST localhost:8000/replay/2024/21/resume
+curl      localhost:8000/replay/2024/21                  # status: estado, velocidade, volta, dono
+curl -X POST localhost:8000/replay/2024/21/stop
+```
+
+### 6. Métricas
+
+```bash
+curl -s localhost:8000/metrics | grep -E "^f1_"                  # API
+curl -s "http://$(docker compose port --index 1 worker 9108)/metrics" | grep -E "^f1_worker"   # worker 1
+```
 
 Para parar: `docker compose down` mantém os dados; `docker compose down -v` apaga os volumes.
 
 ### Sem Docker para a API (desenvolvimento)
 
-Só o banco roda no Docker; Python roda na sua máquina.
+Só o banco e o Redis rodam no Docker; a API e o worker rodam na sua máquina (dois terminais).
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-cp .env.example .env              # ajuste POSTGRES_PORT se tiver mapeado outra porta
-docker compose up -d db
+cp .env.example .env              # ajuste POSTGRES_PORT / REDIS_PORT se precisar
+docker compose up -d db redis
 
 alembic upgrade head
 python -m ingestion --year 2024 --round 21
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload     # terminal 1: a API
+python -m worker                  # terminal 2: o worker (inicie mais cópias se quiser)
 ```
 
 ## API
 
 | Endpoint | Descrição | Respostas |
 |---|---|---|
-| `GET /health` | Separa **processo vivo** de **banco acessível** | `200` tudo ok · `503` banco inacessível |
+| `GET /health` | **Processo vivo**, **banco** e **Redis** | `200` (com `status: "degraded"` se só o Redis caiu) · `503` banco inacessível |
+| `GET /metrics` | Métricas Prometheus da API | `200` |
 | `GET /races/{year}/{round}/laps` | Voltas da corrida (tempo, composto, idade do pneu, stint, posição) | `200` · `404` corrida não ingerida · `422` parâmetro inválido |
-| `GET /races/{year}/{round}/laps?driver=VER` | Só as voltas de um piloto (código de 3 letras, sem diferenciar maiúsculas) | `200` · `404` piloto fora da corrida · `422` formato inválido |
+| `GET /races/{year}/{round}/laps?driver=VER` | Só as voltas de um piloto (código de 3 letras) | `200` · `404` piloto fora da corrida · `422` formato inválido |
+| `POST /replay/{year}/{round}/start` | Inicia o replay nesta instância (corpo opcional: `{"speed": 1\|4\|16}`) | `202` · `404` corrida não ingerida · `409` já há replay · `422` velocidade inválida ou corrida sem dados · `503` Redis fora |
+| `POST /replay/{year}/{round}/pause` `/resume` `/stop` | Pausa (congela o tempo de corrida), retoma de onde parou, encerra | `200` com o status · `409` não há replay ativo · `504` o dono não respondeu |
+| `POST /replay/{year}/{round}/speed` | Muda para 1x, 4x ou 16x sem reiniciar nem pular | `200` · `409` · `422` · `504` |
+| `GET /replay/{year}/{round}` | Status do replay, lido do Redis (vale de qualquer instância) | `200` · `404` nunca iniciado ou expirado |
+| `WS /ws/races/{year}/{round}` | Snapshot do estado e, depois, os eventos em tempo real | fecha com `1013` se o cliente for lento |
+| `GET /frontend/` | Página de teste do WebSocket (HTML + JS, servida pela API) | `200` |
 
 Regras que valem a pena conhecer:
 
@@ -169,49 +369,169 @@ Regras que valem a pena conhecer:
   lista os códigos válidos daquela corrida.
 - **Piloto que não largou** (DNS) é `200` com lista vazia: ele consta na corrida, só não tem voltas.
   Isso é diferente de um código que não participou (`404`).
-- **`/health` com banco fora do ar** responde `503` com o corpo
-  `{"status":"degraded","checks":{"process":"ok","database":"unavailable"}}`. O detalhe do erro
-  vai só para o log, nunca para a resposta.
+- **`/health` com o banco fora** responde `503`. **Com só o Redis fora** continua `200`: o corpo traz
+  `"redis":"unavailable"` e `"status":"degraded"`, mas o código HTTP não muda, porque só o streaming
+  depende do Redis e as rotas REST seguem funcionando (tirar a instância do balanceador derrubaria
+  o que ainda funciona). O detalhe de qualquer erro vai só para o log, nunca para a resposta.
+- **Um replay por corrida**, mesmo com várias instâncias: o segundo `start` recebe `409`.
 
-Exemplo (`?driver=VER`, GP do Brasil 2024, trecho):
+### O protocolo do WebSocket
+
+O 1º frame é sempre o snapshot (JSON de texto); depois chega **um evento por frame**. Os exemplos
+abaixo estão abreviados (o snapshot real traz todos os carros e todos os campos do status).
 
 ```json
-{
-  "race": { "year": 2024, "round": 21, "name": "São Paulo Grand Prix", "total_laps": 69 },
-  "driver": "VER",
-  "laps": [
-    { "driver": "VER", "lap_number": 1, "lap_time_ms": 99161, "compound": "INTERMEDIATE",
-      "tyre_life": 1, "stint": 1, "position": 11, "completed_at": "2024-11-03T15:51:36.953000Z" },
-    { "driver": "VER", "lap_number": 2, "lap_time_ms": 87134, "compound": "INTERMEDIATE",
-      "tyre_life": 2, "stint": 1, "position": 10, "completed_at": "2024-11-03T15:53:04.087000Z" }
-  ]
-}
+{"type": "snapshot", "as_of": "1730649000123-0", "epoch": 3,
+ "race": {"state": "running", "lap": 3, "total_laps": 69},
+ "cars": {"VER": {"x": -3949, "y": -4124, "pos_t": 1730649000100,
+                  "lap": 2, "lap_t": 1730648990000, "lap_time_ms": 87134,
+                  "compound": "SOFT", "position": 1}},
+ "classification": ["VER", "NOR", "LEC"],
+ "replay": {"state": "running", "speed": 16.0, "owner": "api-1", "epoch": 3}}
+
+{"type": "position",      "id": "1730649000125-0", "epoch": 3, "driver": "VER", "x": -3950, "y": -4120, "t": 1730649000320}
+{"type": "lap_completed", "id": "1730649000130-0", "epoch": 3, "driver": "NOR", "lap": 3, "t": 1730649001000,
+ "lap_time_ms": 87500, "compound": "SOFT", "position": 2}
+{"type": "race_status",   "id": "1730649000131-0", "epoch": 3, "state": "running", "lap": 4, "total_laps": 69, "t": 1730649001000}
 ```
+
+`t` é o instante da corrida em milissegundos Unix (UTC); `id` é o ID da entrada no stream. Quem
+escreve um cliente precisa seguir **quatro regras** (todas implementadas em `RaceView`, em
+`scripts/watch_race.py`):
+
+1. **Epoch.** Um evento com `epoch` **maior** que o seu é de um replay novo: descarte o estado e
+   recomece. Um com epoch **menor** é de um replay antigo: ignore.
+2. **Versões por piloto.** Uma `position` só vale se o `t` dela for **maior** que o `pos_t` que você
+   já tem; uma `lap_completed`, se o `t` for maior que o `lap_t`. Eventos repetidos (o catch-up
+   repete o que o snapshot já refletia) ficam inofensivos.
+3. **Status da corrida.** Só avança em (volta, estado): `started` < `running` < `finished`.
+4. **Classificação** (derivada): mais voltas completas primeiro; empatando, quem cruzou a linha
+   antes. É a ordem **na pista** (ver as limitações).
+
+Códigos de fechamento: `1013` (tente de novo: o cliente não acompanhou a velocidade dos eventos; ao
+reconectar ele recebe um snapshot novo) e `1011` (Redis indisponível).
+
+## Métricas
+
+Cada processo expõe as **suas** métricas: a API em `/metrics` e o worker em
+`:9108/metrics` (porta configurável por `WORKER_METRICS_PORT`, `0` desliga). No Compose a porta do
+worker é publicada em `127.0.0.1` com número sorteado (funciona com `--scale worker=N`): descubra com
+`docker compose port --index 1 worker 9108`.
+
+| Métrica | Tipo | Onde | O que mede |
+|---|---|---|---|
+| `f1_ws_clients_connected` | gauge | API | Clientes WebSocket conectados a esta instância |
+| `f1_ws_connections_total` | counter | API | Conexões aceitas |
+| `f1_ws_slow_client_disconnects_total` | counter | API | Clientes desconectados (1013) por lentidão |
+| `f1_replay_events_published_total` | counter | API | Eventos publicados pelo motor (use `rate()` para eventos/s) |
+| `f1_delivery_latency_seconds` | histograma | API | Publicação no stream até o fim do envio ao cliente, buckets de 1 ms a 1 s |
+| `f1_stream_length{race}` | gauge | API | Entradas retidas no stream da corrida |
+| `f1_consumer_group_lag{race,group}` | gauge | API | Entradas que o grupo ainda **não leu** |
+| `f1_consumer_group_pending{race,group}` | gauge | API | Entregues e sem `XACK` (em processamento, ou de um worker morto) |
+| `f1_redis_up` | gauge | API | `1` se o scrape leu o Redis, `0` se não |
+| `f1_worker_events_total{result}` | counter | worker | `applied`, `ignored` (a trava de ordem em ação) e `malformed` |
+| `f1_worker_claimed_total` | counter | worker | Entradas resgatadas de um worker que sumiu (`XAUTOCLAIM`) |
+| `f1_worker_apply_latency_seconds` | histograma | worker | Publicação até o estado gravado: o quão fresco está o snapshot |
+
+Detalhes que importam:
+
+- **Lag e tamanho do stream são lidos no instante do scrape** por um *collector* customizado
+  (`XINFO GROUPS`), e não por um laço de fundo que atualiza um gauge a cada N segundos: o valor é,
+  por construção, o de agora, não gasta Redis sem ninguém raspando e não vira mais uma tarefa para
+  dar errado.
+- **O lag sai da API, não do worker**: é a métrica que alerta "os workers não dão conta". Se
+  dependesse do worker, quando *todos* morressem (o pior caso) ela sumiria junto.
+- **Cardinalidade:** os únicos rótulos são `race`, `group` e `result` (poucos valores). Piloto, ID de
+  evento, nome de consumidor ou cliente **nunca** viram rótulo (seriam milhares de séries). Há um
+  teste que varre os registros e falha se isso mudar.
+- **Se o Redis cair**, o `/metrics` não falha: `f1_redis_up` vai a `0` e o resto continua exposto.
+- `/metrics` não tem autenticação (não há dado sensível); em produção restrinja o acesso na borda.
+
+Exemplo de configuração do Prometheus e de consultas:
+
+```yaml
+scrape_configs:
+  - job_name: f1-api
+    static_configs: [{targets: ["app:8000"]}]
+  - job_name: f1-worker
+    dns_sd_configs: [{names: ["worker"], type: A, port: 9108}]   # uma instância por cópia
+```
+
+```promql
+sum(rate(f1_replay_events_published_total[1m]))                                   # eventos/s
+max by (race) (f1_consumer_group_lag)                                             # alerta se subir e não descer
+histogram_quantile(0.99, sum by (le) (rate(f1_delivery_latency_seconds_bucket[1m])))   # p99 de entrega
+```
+
+### Por que não o modo multiprocess do `prometheus-client`
+
+O modo multiprocess (`PROMETHEUS_MULTIPROC_DIR`) existe para servidores que **bifurcam** em vários
+processos que respondem pelo mesmo endpoint (por exemplo, `gunicorn -w 4`): cada processo grava suas
+métricas em arquivos mapeados em memória num diretório compartilhado, e a raspagem os agrega. Não é
+o nosso caso, e custaria caro:
+
+- API e worker são **programas diferentes**, com ciclos de vida diferentes. Cada um é um alvo de
+  scrape próprio, e o Prometheus já foi feito para isso (rótulo `instance`, agregação com `sum by`).
+  Juntá-los exigiria um volume compartilhado entre os containers, acoplando dois serviços só por
+  causa das métricas.
+- Esconde a saúde por processo: as métricas de um worker morto ficariam no diretório até alguém
+  limpar, em vez de o alvo simplesmente sumir (que é o sinal certo).
+- Os *collectors* que leem estado no instante do scrape (clientes conectados, lag do Redis) não
+  combinam com o modo multiprocess, que agrega arquivos de contadores.
+
+Se um dia a API rodar com vários processos `uvicorn --workers N` *dentro do mesmo container*, aí
+sim o modo multiprocess passa a fazer sentido, só para a API.
 
 ## Testes
 
 ```bash
-pytest -m "not integration"       # unitários: poucos segundos, sem banco nem rede
-pytest                            # tudo; requer o banco (docker compose up -d db)
+pytest -m "not integration"       # unitários: segundos, sem banco, Redis nem rede
+pytest                            # tudo; requer banco e Redis (docker compose up -d db redis)
 ```
 
-- **Unitários:** SQLite em memória com dados semeados à mão, e DataFrames sintéticos com as
-  mesmas colunas e tipos do FastF1 (incluindo os casos de borda: volta sem tempo, piloto sem
-  composto de pneu, nulos nas posições). Nenhum teste baixa dados da F1.
-- **Integração** (marker `integration`): cada execução cria um **banco descartável** no
-  TimescaleDB do Compose, roda a migration de verdade e o apaga no final, então seus dados de
-  desenvolvimento nunca são tocados. Cobrem o que o SQLite não alcança: a hypertable, o
-  `ON CONFLICT` do Postgres, a atomicidade da ingestão e a deriva entre models e migrations
-  (`alembic check`).
-- Sem banco acessível, os de integração são **pulados** com a instrução de como subir o banco.
-  Com `REQUIRE_INTEGRATION_DB=1` (o que o CI usa) eles **falham**, para nunca passarem em silêncio.
+- **Unitários:** SQLite em memória com dados semeados à mão e DataFrames sintéticos com as mesmas
+  colunas e tipos do FastF1; o motor de replay usa um **relógio injetado** (nada de `sleep` real, o
+  teste roda uma hora de corrida em milissegundos e confere o instante exato de cada evento). O
+  `tests/test_frontend.py` roda o JS da página no `node` e o compara com o cliente Python em 60
+  cenários aleatórios (é pulado se o `node` não existir).
+- **Integração** (marker `integration`): **TimescaleDB e Redis reais**. Cada execução cria um banco
+  descartável (a migration roda de verdade) e usa o banco lógico 15 do Redis, esvaziado a cada
+  teste, então seus dados de desenvolvimento nunca são tocados. Cobrem o que um dublê não alcança:
+  a hypertable, o `ON CONFLICT`, o script Lua, o consumer group, o `XAUTOCLAIM`, o controle entre
+  processos e um servidor `uvicorn` **real** com clientes WebSocket reais entrando no meio de um
+  replay.
+- Sem banco/Redis acessível, os de integração são **pulados** com a instrução de como subir; com
+  `REQUIRE_INTEGRATION_DB=1` (o que o CI usa) eles **falham**, para nunca passarem em silêncio.
+- **Por que Redis real, e não `fakeredis` ou `testcontainers`:** o que precisa de prova (Lua,
+  `XAUTOCLAIM`, `BLPOP`, o bloqueio do `XREAD`, a expiração por TTL) são comportamentos *do
+  servidor*, e um emulador só cobre parte deles, com risco de falso positivo. `testcontainers`
+  resolveria, mas subiria containers de dentro dos testes; o Redis do Compose (e o *service
+  container* do CI) já está lá.
+- Os testes de concorrência foram validados **quebrando o código de propósito** (sem a trava de
+  versão, sem o `XAUTOCLAIM`, com a marca d'água ingênua...): cada defeito é pego pelo teste certo.
 
-Lint: `ruff check . && ruff format --check .`
-
-O CI (GitHub Actions) roda o lint primeiro, para falhar rápido, e só então os testes, com um
-TimescaleDB real como service container.
+Lint: `ruff check . && ruff format --check .`. O CI (GitHub Actions) roda o lint primeiro, para
+falhar rápido, e só então os testes, com TimescaleDB e Redis reais como service containers.
 
 ## Decisões de design
+
+### Fase 2: replay em streaming
+
+| Decisão | Por quê |
+|---|---|
+| **Redis Streams, não Pub/Sub** | O Stream é um log com IDs crescentes e *consumer groups*: quem cai volta de onde parou e o Redis sabe o que cada grupo leu e o que ficou pendente. Pub/Sub é "dispara e esquece" e perde o que ninguém escutava no instante. |
+| **Consumer group compartilhado, estado no Redis** | Num grupo, cada entrada vai para **um** worker: N workers dividem a carga (~1.760 eventos/s a 16x). Só é correto porque o estado não fica na memória do worker (cada um teria uma fatia dos eventos). E o WebSocket precisa de um snapshot que qualquer instância da API leia. |
+| **Script Lua "grava só se a versão for maior"** | Dois workers aplicam eventos do mesmo piloto em qualquer ordem; sem a trava, um evento velho processado por último sobrescreveria o novo. O Lua faz ler, comparar e gravar de forma atômica, num único ida-e-volta (o `WATCH` repetiria sob conflito, que aqui é constante). Reentregar um evento é inofensivo: versão igual não é maior. |
+| **Epoch por replay** | Reproduzir a mesma corrida repete os mesmos tempos; sem o epoch, o estado do replay anterior bloquearia o novo, e um evento atrasado do antigo travaria o novo. O Lua compara o epoch antes da versão. |
+| **Marca d'água no snapshot** | O worker aplica *depois* da publicação; ler o snapshot e seguir "do último ID do stream" deixa um buraco. A marca d'água (o ID até o qual tudo foi *aplicado*) mais o catch-up pelo `XRANGE` fecham a cobertura. |
+| **`XAUTOCLAIM` para worker morto** | As pendências de um worker que morre ficam no PEL dele, e o Redis não as redistribui sozinho. Todo worker resgata o que está ocioso há mais de 10 s (bem acima de um lote normal, para não roubar de quem só está trabalhando). |
+| **Cliente lento: fila limitada + `1013`** | Fila ilimitada estoura a memória; esperar o cliente trava todos os outros; descartar em silêncio deixa o cliente "conectado" com o estado corrompido. Com a fila limitada, o hub nunca espera cliente e quem não acompanha é fechado com `1013` e recebe um snapshot novo ao reconectar: falha visível e recuperável. |
+| **Leitura por keyset, não `OFFSET`** | Cada página parte de "depois da última linha que vi" pelo índice `(race_id, time)`: custo constante por página. Medido nas 797 mil linhas: 160 páginas em 1,2 s; na linha 400 mil, `OFFSET` leva 129 ms e o keyset 7 ms. Memória: 4 MB contra ~270 MB do `.all()`. |
+| **Ritmo por âncora, não soma de `sleep`** | O instante de cada evento é calculado a partir do tempo de corrida (relógio monotônico); trocar a velocidade ou pausar só move a âncora. Somar `sleep` acumularia o atraso de cada um. Medido com relógio real e duas trocas de velocidade: erro entre -4 e +11 ms, sem crescer. |
+| **`MAXLEN ~ 100.000`** | O stream é um buffer de *catch-up*, não o histórico (o histórico é o banco): ~15 min a 1x e ~1 min a 16x. Medido: 4,2 MB para 100 mil entradas, então o limite é ditado pela janela de recuperação, não pela memória. |
+
+<details>
+<summary><strong>Fase 1: dados e ingestão</strong></summary>
 
 | Decisão | Por quê |
 |---|---|
@@ -224,6 +544,8 @@ TimescaleDB real como service container.
 | **Imagem do Timescale com versão fixa** | A extensão vive dentro do volume de dados; trocar a versão do binário sob um volume existente exige `ALTER EXTENSION ... UPDATE`. Fixar evita que um `pull` mude o comportamento sem ninguém perceber. |
 | **`/health` com `connect_timeout`** | Sem timeout, um banco sumido na rede (firewall descartando pacotes) faria o endpoint pendurar em vez de responder `503`. |
 | **Contrato da API separado dos models** | `schemas.py` ≠ `models.py`: o banco pode evoluir sem quebrar quem consome a API. |
+
+</details>
 
 ### O que os dados reais ensinaram
 
@@ -240,18 +562,59 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 - O contador de linhas do SQLAlchemy devolve `-1` em `INSERT`; o relatório de idempotência usa
   `preserve_rowcount` para mostrar números reais.
 
+## Limitações conhecidas
+
+- **A classificação é a ordem *na pista*, não a oficial.** É derivada das voltas (mais voltas primeiro,
+  depois quem cruzou a linha antes). No GP do Brasil 2024 ela bate com a classificação oficial em
+  **17 das 20 posições**; as diferenças são penalidades e desqualificações, que só existem no
+  resultado oficial e não nos horários das voltas: TSU e PIA (o PIA cruzou antes, mas a ordem oficial
+  os inverte, o que é compatível com uma penalidade de tempo pós-corrida) e o HUL (desqualificado,
+  logo último oficialmente apesar das voltas completas).
+- **O catch-up pode ser pesado se nenhum worker estiver rodando.** Sem workers a marca d'água é
+  `0-0` (nada foi aplicado), então o catch-up envia ao cliente o stream retido inteiro (até 100 mil
+  entradas). É correto, mas custoso; o normal é haver workers e a marca d'água estar a poucos
+  eventos do fim.
+- **O cliente lento foi testado só no nível do hub e da sessão**, com um WebSocket falso travado de
+  propósito (a fila enche, o cliente é desconectado, o hub e os outros clientes não sofrem). Não
+  consegui provocar o estouro da fila por TCP real: o buffer do kernel absorve milhares de eventos
+  antes de o envio parar.
+- **A latência de entrega mede o relógio do Redis contra o da API.** Na mesma máquina (o Compose) é
+  exata; com o Redis em outra máquina inclui o desvio entre os relógios (por isso nunca é negativa).
+- **Se o dono do replay morre, o replay para**: o status expira em até 10 s e o lock em até 10 s;
+  um novo `start` recomeça a corrida do zero (não há retomada automática). Se o Redis fica fora
+  além do retry do cliente (~4 s), o replay termina como `failed`.
+- **Um único Redis**, sem alta disponibilidade, e a API não tem autenticação (nem REST, nem
+  WebSocket, nem `/metrics`): é um projeto de portfólio, não um serviço para a internet aberta.
+- **A página não foi aberta num navegador de verdade.** Não havia navegador na máquina de
+  desenvolvimento. O que foi verificado: a API a serve; as regras do protocolo (`race_view.js`)
+  chegam ao mesmo estado que o cliente Python em 60 cenários aleatórios (teste de conformidade, JS
+  rodado no `node`); e o script da página foi executado no `node` com um DOM de mentira e o
+  WebSocket e o `fetch` reais (conectar, iniciar, pausar, mudar a velocidade, retomar, parar). O
+  CSS e o layout não foram vistos.
+- **`websocat`**: o comando acima segue o protocolo e é equivalente ao do script Python, mas só o
+  script e o cliente dos testes foram executados contra o servidor.
+
 ## Estrutura
 
 ```
-app/            API FastAPI (config, deps, schemas, routers/)
+app/            API FastAPI: config, deps, schemas, hub (WebSocket), metrics, routers/
+replay/         motor de replay: fonte (keyset), timeline, engine, publisher, estado (Lua),
+                lock, controle entre processos, manager
+worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
-tests/          unitários, ingestion/ (loader, CLI) e integration/ (Timescale real)
+scripts/        watch_race.py: cliente de referência do WebSocket
+frontend/       página de teste do WebSocket (HTML + JS, sem build), servida pela API
+tests/          unitários, ingestion/, replay/ e integration/ (Timescale e Redis reais)
 .github/        workflow de CI
 docker-compose.yml · Dockerfile · .env.example
 ```
 
-## Roadmap
+## Próximos passos possíveis
 
-- **Fase 2 (planejada):** replay da corrida em tempo real a partir do banco, com Redis Streams
-  e WebSocket.
+- **Conflação** no cliente lento: guardar só a última posição de cada piloto e nunca descartar
+  voltas, em vez de desconectar.
+- **Retomada automática** do replay quando o dono morre (o estado de pausa e o ponto de corrida já
+  estão no Redis).
+- **Classificação oficial** a partir do resultado final (penalidades e desqualificações), exibida
+  ao lado da ordem na pista.

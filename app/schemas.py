@@ -14,6 +14,7 @@ class ErrorResponse(BaseModel):
 class HealthChecks(BaseModel):
     process: Literal["ok"]  # se o endpoint respondeu, o processo está vivo
     database: Literal["ok", "unavailable"]
+    redis: Literal["ok", "unavailable"]
 
 
 class HealthResponse(BaseModel):
@@ -50,3 +51,32 @@ class RaceLapsResponse(BaseModel):
     race: RaceOut
     driver: str | None  # o filtro aplicado (normalizado em maiúsculas), ou null se não houve
     laps: list[LapOut]
+
+
+# ---------------------------------------------------------------- replay
+
+# Só estas velocidades (1x, 4x, 16x): um valor fora delas é 422 já na validação do corpo.
+ReplaySpeed = Literal[1, 4, 16]
+
+
+class StartReplayRequest(BaseModel):
+    speed: ReplaySpeed = 1
+
+
+class SetSpeedRequest(BaseModel):
+    speed: ReplaySpeed
+
+
+class ReplayStatusOut(BaseModel):
+    """O status do replay como qualquer instância da API o enxerga (vem do Redis)."""
+
+    state: Literal["pending", "running", "paused", "finished", "stopped", "failed"]
+    speed: float
+    race_time_ms: int | None  # onde o replay está, no tempo da corrida (ms desde a época Unix)
+    lap: int | None  # volta do líder
+    total_laps: int | None
+    events_published: int
+    error: str | None
+    epoch: int  # número do replay (muda a cada start)
+    owner: str  # a instância da API que roda o motor
+    updated_at_ms: int  # quando o dono publicou este status (relógio dele)
