@@ -780,6 +780,40 @@ avaliada**:
   (desqualificação não é abandono). Mesmo desenho do SC: probabilidade e fração da corrida, das outras
   corridas.
 
+#### Monte Carlo da corrida: o que simula, o que é heurística
+
+`strategy/montecarlo.py`, detalhes e medidas em `docs/montecarlo.md`. 5.000 corridas do que falta (da
+volta N ao fim), em arrays pilotos x simulações; cada simulação sorteia os parâmetros incertos (a
+incerteza do modelo entra na probabilidade), o ruído de cada volta, o Safety Car, os abandonos e as
+paradas, e o vencedor é quem completa mais voltas e cruza a linha primeiro.
+
+- **O Safety Car é um evento da corrida, não uma taxa por volta.** Quantos, quando e por quanto tempo
+  vêm de outras corridas; a incerteza da taxa (Gamma posteriori) entra em **cada simulação**, então ela
+  vira incerteza da probabilidade de vitória. Sensibilidade em 0,5x, 1x e 2x nos mesmos números
+  aleatórios.
+- **O que o SC faz foi medido:** o ritmo cai a ~1,46x, o pelotão fecha a ~1,9 s e a parada custa ~0,58x.
+  O **desgaste do pneu sob SC (0,3 da volta verde) é uma heurística**.
+- **Heurísticas declaradas (não medidas):** *quando os outros carros param* (o ganho de trocar agora
+  até o fim passa a perda no pit, com folga sorteada; quem não usou dois compostos para até 3 voltas do
+  fim), *o composto seguinte* (contagem histórica) e *tráfego e ultrapassagem* (a regra do undercut: sem
+  0,7 s/volta de vantagem o carro não passa e fica a 0,7 s atrás, só o carro imediatamente à frente
+  segura). Equipes decidem por rivais e estratégia que o ganho de tempo não vê.
+- **Abandono:** probabilidade por piloto-corrida (Beta, 9,8% medido) e volta, das outras corridas. Sem
+  ele a probabilidade do líder fica otimista. Abandono não causa SC na simulação.
+- **Reprodutível e comparável:** `SeedSequence` de (ano, etapa, volta) e um stream por componente; cada
+  um gasta sempre a mesma quantidade de números, então as variantes de `k` usam **os mesmos números** e a
+  diferença entre elas é sinal. Cada probabilidade vem com `sqrt(p(1-p)/n)`.
+- **Onde roda e a fila:** numa thread do consumidor de estratégia (processo separado da API), nunca no
+  event loop. Uma volta nova **cancela** a simulação em curso e **substitui** a que esperava: não há fila.
+  Medido: ~21 ms por volta que falta com 20 carros (corrida inteira ~1 s, fim de corrida ~0,05 s).
+- **Um erro meu que testes pegaram:** com relógios exatamente iguais, quem ficava na frente era o de
+  código alfabeticamente menor (80% para um de dois carros idênticos); e a volta de entrada nos boxes,
+  já no relógio, tinha a perda contada duas vezes na volta de saída.
+- **O que NÃO validei:** nenhuma probabilidade contra corridas reais (o avaliador está pronto, com o
+  Brier por volta e **bootstrap sobre corridas**, porque o tamanho efetivo da amostra é o número de
+  corridas e não o de voltas; roda no backtest da etapa 8). O SC depois da volta 10 vem de 3 eventos.
+  VSC e bandeira vermelha ficam de fora.
+
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
 
@@ -851,6 +885,10 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 
 **Estratégia (Fase 3, até aqui):**
 
+- **O Monte Carlo ainda não foi medido contra corridas reais.** Está validado por propriedades (soma 1,
+  pódio 3, simetria, determinismo, sem vazamento) e contas de papel. As regras de parada e de
+  ultrapassagem e o desgaste sob SC são heurísticas; o SC no meio da corrida vem de 3 eventos; VSC e
+  bandeira vermelha não entram (`docs/montecarlo.md`).
 - **O alerta de undercut ainda não foi medido contra paradas reais.** Está validado só com dados
   sintéticos de resposta conhecida e uma execução em uma corrida real. Os limiares (0,6 liga, 0,5
   desliga), o fator de inflação do desvio (1,3), a regra de ultrapassagem e o horizonte `K` são
@@ -927,7 +965,8 @@ replay/         motor de replay: fonte (keyset), timeline, engine, publisher, es
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
 strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo,
-                undercut e a avaliação dele (undercut_eval), history (SC, abandonos, compostos)
+                undercut e a avaliação dele (undercut_eval), history (SC, abandonos, compostos),
+                montecarlo, forecast_runner (executor só-a-última), forecast_eval, metrics
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
