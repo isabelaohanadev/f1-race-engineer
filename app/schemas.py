@@ -199,11 +199,14 @@ class StrategyOut(BaseModel):
     )
     alerts: list[UndercutAlertOut] = Field(
         description="Alertas de undercut ligados (limiar 0,6, histerese em 0,5). RESSALVA DO VIÉS "
-        "DE SELEÇÃO: o backtest só observou as paradas que aconteceram, e as equipes tendem a "
-        "parar quando funciona. A precisão medida (83% em 18 alertas, intervalo de Wilson de 61% "
-        "a 94%) é OTIMISTA e a revocação não é mensurável. O intervalo de 90% da margem cobriu "
-        "81% (o fator de inflação congelado, 1,3, ficou baixo). Avaliados no instante em que o "
-        "líder completa a volta; o backtest os mediu no instante do atacante."
+        "DE SELEÇÃO: só se observam as paradas que aconteceram, e as equipes tendem a parar "
+        "quando funciona. A precisão medida é OTIMISTA, a revocação não é mensurável e a "
+        "amostra é pequena. São avaliados no instante em que o líder completa a volta, a forma "
+        "medida offline em docs/undercut-ao-vivo.md (10 de 12 alertas certos, intervalo de "
+        "Wilson de 55% a 95%): o backtest mediu outra forma (o instante do atacante), e os "
+        "números dele não valem para esta. O líder nunca é o rival: nenhum undercut contra o "
+        "líder é alertado. O fator de inflação congelado (1,3) deixou o intervalo da margem "
+        "curto."
     )
     warnings: list[StrategyWarningOut] = Field(
         description="SC em curso (modelado), VSC e bandeira vermelha (fora do simulador)."

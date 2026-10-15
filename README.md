@@ -786,16 +786,19 @@ Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
   rodada e reforçou um teste).
 - **O que NÃO validei antes do backtest:** tudo era dado sintético, onde o desvio previsto ficou bem
   acima do erro (|z| < 0,35) porque o mundo sintético não tem espalhamento entre corridas. **O backtest
-  mediu** (veja abaixo): o fator de inflação congelado (1,3) deixou o intervalo de 90% da margem cobrindo
-  81%, e os dados pedem 1,87; o valor **não foi mudado** (mudar depois de ver o resultado deixaria de ser
-  uma avaliação limpa). A regra de ultrapassagem (0,7 s/volta de vantagem, 0,7 s de distância) continua
+  mediu** (a forma antiga, no instante do atacante) e **a forma ao vivo foi medida à parte**
+  (`docs/undercut-ao-vivo.md`): nas duas, o fator de inflação congelado (1,3) deixou o intervalo de 90%
+  da margem curto; o valor **não foi mudado** (mudar depois de ver o resultado deixaria de ser uma
+  avaliação limpa). A regra de ultrapassagem (0,7 s/volta de vantagem, 0,7 s de distância) continua
   heurística; os outros carros não param no horizonte; o composto seguinte é o mais provável, não o
   escolhido.
-- **A avaliação nas paradas reais rodou no backtest** (resultado na seção "O backtest" abaixo e em
-  `docs/backtest.md`). Cada parada real é um evento, o resultado real sai dos relógios, as constantes
-  saem sem a corrida avaliada. **O viés:** só se observam as paradas que aconteceram, e as equipes
-  tendem a parar quando funciona; a precisão medida é otimista, a revocação não é mensurável, e a
-  calibração é condicional a "a equipe decidiu parar".
+- **A avaliação nas paradas reais rodou no backtest** (`docs/backtest.md`, a **forma antiga**: o alerta
+  no instante em que o atacante completa a volta) **e, à parte, na forma ao vivo** (o instante em que o
+  líder completa a volta, que é a que o consumidor entrega: `docs/undercut-ao-vivo.md`). Cada parada
+  real é um evento, o resultado real sai dos relógios, as constantes saem sem a corrida avaliada. **O
+  viés:** só se observam as paradas que aconteceram, e as equipes tendem a parar quando funciona; a
+  precisão medida é otimista, a revocação não é mensurável, e a calibração é condicional a "a equipe
+  decidiu parar". **Os números de uma forma não valem para a outra.**
 
 #### Safety Car, abandonos e trocas de composto: o que medi (e o que é pouco)
 
@@ -886,12 +889,14 @@ Relatório completo e gerado dos números: `docs/backtest.md`. **O resultado é 
   pares, 19 corridas, intervalo de 38% a 79%). Acima de 0,5 são poucos pares: pouco diz.
 - **As três variantes de `k` e a taxa de SC (0,5x, 1x, 2x) não se distinguem** nesta amostra. Não é
   prova de que não importam, só de que 21 corridas não as separam.
-- **O alerta de undercut, ao vivo:** 18 alertas, 15 certos (precisão 83%, Wilson 61% a 94%), Brier 0,130
-  contra 0,235 de quem prevê a taxa-base. **Otimista pelo viés** (só as paradas que aconteceram) e a
-  revocação não é mensurável. O intervalo de 90% da margem cobre 81%, não 90%. No oráculo (horizonte e
-  compostos reais) a precisão é 67% (47% a 82%).
+- **O alerta de undercut no backtest é a forma ANTIGA** (avaliado no instante do atacante; os números
+  estão em `docs/backtest.md`, seção 6): precisão **otimista pelo viés** (só as paradas que aconteceram),
+  revocação não mensurável e intervalo de 90% da margem curto. **Esses números não valem para o
+  consumidor**, que alerta no instante do líder; essa forma foi medida à parte (ver "O alerta de
+  undercut na forma ao vivo", abaixo).
 - **O desenho antigo me enganaria:** com o estado por contagem de voltas (cada piloto na volta N dele) o
-  Brier da vitória sairia 0,030 melhor [0,011; 0,048] e a precisão do alerta 93% em vez de 83%.
+  Brier da vitória sairia 0,030 melhor [0,011; 0,048] e o alerta de undercut também sairia mais
+  preciso (`docs/backtest.md`, seção 7).
 - **Diagnóstico posterior, não faz parte do backtest** (`docs/backtest-diagnostico.md`): desligo um
   componente de incerteza por vez, nos mesmos números aleatórios. No meio da corrida o Monte Carlo dá
   0,54 ao favorito e ele ganha 0,68 (hesita demais); sem a incerteza do modelo ele passa a dar 0,83 e
@@ -932,9 +937,24 @@ cada volta do líder durante um replay, o Monte Carlo e os alertas de undercut, 
 - **O `GET` só lê**: nunca calcula, e um teste confere que ele não cria nenhuma chave no Redis.
 - **O que NÃO validei:** o serviço no Compose (não há Docker CLI aqui: o processo real foi testado
   contra o Redis e o Timescale reais, com um `SIGKILL` de verdade, mas não o `docker compose up`);
-  **os alertas ao vivo são avaliados no instante do líder, e o backtest os mediu no do atacante** (a
-  precisão de 83% não vale para esta forma); o backtest mediu as voltas 5, 10, 15…, e ao vivo
-  calcula-se toda volta; só 5 das 24 corridas têm replay (as outras vieram de `--laps-only`).
+  o backtest mediu as voltas 5, 10, 15…, e ao vivo calcula-se toda volta; só 5 das 24 corridas têm
+  replay (as outras vieram de `--laps-only`).
+
+#### O alerta de undercut na forma ao vivo
+
+Os alertas ao vivo disparam quando o **líder** completa a volta; o backtest mediu quando o
+**atacante** completa (a forma antiga), e os números dele não valem para a ao vivo. A forma ao vivo foi
+**avaliada offline nas mesmas paradas reais** (`docs/undercut-ao-vivo.md`; o protocolo foi commitado
+antes da execução, e limiar e fator de inflação não foram ajustados):
+
+- **O líder nunca é o rival na forma ao vivo**: no instante em que ele completa a volta, os outros
+  estão na anterior, e o carro à frente só vale na mesma volta. Dos 115 eventos, 13 ficam de fora por
+  isso (e **nenhum undercut contra o líder é avaliado nem alertado**) e 24 por o par ao vivo ser outro.
+- **O que sobra é pouco e otimista:** nos 43 eventos primários, os alertas no limiar acertaram 10 de 12
+  (Wilson 55% a 95%); Brier 0,145 contra 0,249 da taxa-base; o intervalo de 90% da margem cobre 0,79.
+  **Só as paradas que aconteceram** entram, então a precisão é otimista e a revocação não é mensurável.
+- **Nos mesmos eventos a forma ao vivo erra mais que a antiga** (Brier +0,024 [+0,009; +0,043], por
+  bootstrap sobre as corridas).
 
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
@@ -1012,16 +1032,18 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   use a probabilidade de vitória dele como previsão melhor que a posição na pista**. As regras de
   parada e de ultrapassagem e o desgaste sob SC são heurísticas; o SC depois da volta 10 vem de 3
   eventos; VSC e bandeira vermelha não entram (`docs/montecarlo.md`).
-- **O alerta de undercut foi medido só nas paradas que aconteceram:** precisão de 83% em 18 alertas
-  (Wilson 61% a 94%) é um valor **otimista**, a revocação não é mensurável, e o intervalo de 90% da
-  margem cobre 81% porque o fator de inflação (1,3, congelado antes) é baixo: os dados pedem 1,87. Os
-  limiares (0,6 liga, 0,5 desliga), a regra de ultrapassagem e o horizonte `K` continuam sem calibração
-  própria (`docs/undercut.md`, `docs/backtest.md`).
+- **O alerta de undercut foi medido só nas paradas que aconteceram:** a precisão é **otimista** e a
+  revocação não é mensurável. O backtest mediu a forma antiga (instante do atacante); a que o consumidor
+  entrega (instante do líder) foi medida à parte (`docs/undercut-ao-vivo.md`): o líder nunca é o rival,
+  a amostra é de dezenas de eventos e ela erra mais que a antiga. O fator de inflação (1,3, congelado
+  antes) deixou o intervalo da margem curto nas duas formas e **não foi mudado**. Os limiares (0,6 liga,
+  0,5 desliga), a regra de ultrapassagem e o horizonte `K` continuam sem calibração própria
+  (`docs/undercut.md`, `docs/backtest.md`).
 - **Estratégia ao vivo: o Monte Carlo ao vivo carrega as limitações do backtest** (acima), e o
   resultado traz `reliability` e o comparador para que ninguém o leia como melhor que a posição na
-  pista. Os alertas ao vivo são avaliados no instante do líder (o backtest, no do atacante); a
-  histerese do alerta não sobrevive a uma troca de instância; só 5 corridas têm replay; o serviço
-  `strategy` do Compose não foi executado por mim (`docs/estrategia-ao-vivo.md`).
+  pista. Os alertas ao vivo são avaliados no instante do líder (o backtest, no do atacante) e foram
+  medidos à parte; a histerese do alerta não sobrevive a uma troca de instância; só 5 corridas têm
+  replay; o serviço `strategy` do Compose não foi executado por mim (`docs/estrategia-ao-vivo.md`).
 - **O backtest cobre uma temporada (2024), 21 corridas secas** e as constantes de cada corrida vêm das
   outras 20, não só das anteriores no calendário; a britânica, o Canadá e o Brasil são avaliados à
   parte (uma corrida cada, sem intervalo).

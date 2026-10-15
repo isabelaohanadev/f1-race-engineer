@@ -122,7 +122,7 @@
       "EXPERIMENTAL (a partir de 80% da corrida): no backtest o Monte Carlo foi PIOR que “o líder atual vence” nesta fase.",
   };
   const ALERT_NOTE =
-    "Alertas medidos só nas paradas que aconteceram: a precisão do backtest (83% em 18 alertas) é otimista.";
+    "Alertas medidos só nas paradas que aconteceram: a precisão é otimista (docs/undercut-ao-vivo.md). O líder nunca é o rival.";
 
   function strategyView(strategy, unsupportedVersion) {
     if (unsupportedVersion !== null && unsupportedVersion !== undefined && !strategy)

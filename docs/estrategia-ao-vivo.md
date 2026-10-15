@@ -83,8 +83,9 @@ entradas embaralhadas dentro da janela, guarda os mesmos números** (em memória
   **Nenhum dos dois quer dizer "confiável".** O corte é `>=` 80% para coincidir com a faixa medida.
 - **`alerts`**: os alertas de undercut **ligados** (limiar 0,6, histerese em 0,5, regras duras de
   sempre). **A ressalva do viés de seleção está na documentação do campo** (`/docs`, schema
-  `StrategyOut.alerts`), não no payload: o backtest só observou as paradas que aconteceram, a
-  precisão medida (83% em 18 alertas, Wilson 61%–94%) é **otimista** e a revocação não é mensurável.
+  `StrategyOut.alerts`), não no payload: só se observam as paradas que aconteceram, a precisão
+  medida é **otimista** e a revocação não é mensurável. A forma ao vivo (o instante do líder) foi
+  medida offline em `docs/undercut-ao-vivo.md`.
 - **`inputs`**: `cars_reported` (carros no estado do cálculo) contra `cars_known` (pilotos vistos no
   stream) diz se o resultado saiu com o pelotão incompleto.
 
@@ -113,10 +114,13 @@ entradas embaralhadas dentro da janela, guarda os mesmos números** (em memória
   `--laps-only`, sem o horário absoluto das voltas (`completed_at`) que o motor usa. A R21 (Brasil) é
   chuva, fora do domínio do modelo.
 - **Os alertas ao vivo são avaliados no instante em que o líder completa a volta; o backtest os mediu
-  no instante do atacante.** Para quem está atrás, o estado do alerta é uma volta mais velho do que o
-  medido. Foi o preço de um contexto só por volta (`build_context` custa ~0,15 s; um por atacante
-  seriam ~3 s por volta). **Esta forma de alertar não foi avaliada**: a precisão de 83% do backtest
-  não vale para ela.
+  no instante do atacante (a forma antiga), e os números dele não valem para a ao vivo.** Para quem
+  está atrás, o estado do alerta é uma volta mais velho. Foi o preço de um contexto só por volta
+  (`build_context` custa ~0,15 s; um por atacante seriam ~3 s por volta). A forma ao vivo foi
+  **medida offline** (`docs/undercut-ao-vivo.md`): o líder nunca é o rival (13 dos 115 eventos ficam
+  de fora por isso, e nenhum undercut contra o líder é alertado), 24 por par diferente, e nos mesmos
+  eventos ela erra mais que a forma antiga. Os alertas acertaram 10 de 12 nos eventos primários
+  (Wilson 55% a 95%), um valor **otimista** pelo viés de seleção e de amostra pequena.
 - **O backtest mediu as voltas 5, 10, 15…; ao vivo calcula-se toda volta a partir da 5.** É a mesma
   função, mas as outras voltas **não foram medidas**.
 - **As constantes saem das outras 20 corridas**, sem a reproduzida (a configuração medida), não só das
