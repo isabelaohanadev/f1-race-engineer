@@ -9,12 +9,13 @@ from app import metrics
 from app.errors import register_exception_handlers
 from app.hub import HubRegistry
 from app.redis_client import create_redis, create_sync_redis
-from app.routers import health, races, replay, ws
+from app.routers import health, races, replay, strategy, ws
 from app.routers import metrics as metrics_router
 from db.session import get_session_factory
 from replay.control import RedisControlPlane
 from replay.manager import ReplayManager
 from replay.state import RaceStateStore
+from strategy.service.results import ResultStore
 
 
 @asynccontextmanager
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         get_session_factory(), redis, on_events_published=metrics.EVENTS_PUBLISHED.inc
     )
     app.state.state_store = RaceStateStore(redis)
+    app.state.strategy_store = ResultStore(redis)
     app.state.hubs = HubRegistry(redis)
     # Collectors: leem o estado ATUAL quando o Prometheus raspa. Registrados aqui (e retirados ao
     # desligar) porque dependem de objetos criados neste lifespan.
@@ -58,6 +60,7 @@ app = FastAPI(
 register_exception_handlers(app)
 app.include_router(health.router)
 app.include_router(races.router)
+app.include_router(strategy.router)
 app.include_router(replay.router)
 app.include_router(ws.router)
 app.include_router(metrics_router.router)

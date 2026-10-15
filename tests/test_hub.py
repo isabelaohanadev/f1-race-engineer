@@ -189,3 +189,68 @@ async def test_a_new_client_after_the_hub_was_released_gets_a_fresh_one():
 
     assert second is not first and not second.closed
     await registry.close()
+
+
+# ---------------------------------------------------------------- o evento `strategy`
+
+
+def result_entry(lap: int, epoch: int = 1, entry_id: str | None = None):
+    import json
+
+    document = {"v": 1, "type": "strategy", "epoch": epoch, "lap": lap}
+    fields = {"v": "1", "epoch": str(epoch), "lap": str(lap), "data": json.dumps(document)}
+    return entry_id or f"{lap}-0", fields
+
+
+async def test_a_strategy_result_reaches_every_client_as_the_document_plus_the_stream_id(
+    hub: RaceHub,
+):
+    import json
+
+    one, two = await hub.subscribe(), await hub.subscribe()
+
+    hub.dispatch_strategy([result_entry(12, epoch=3, entry_id="900-1")])
+
+    for sub in (one, two):
+        message = json.loads(sub.queue.get_nowait().payload)
+        assert message == {"v": 1, "type": "strategy", "epoch": 3, "lap": 12, "id": "900-1"}
+    assert hub.stats.dispatched == 1
+
+
+async def test_strategy_results_share_the_clients_queue_with_the_race_events_in_arrival_order(
+    hub: RaceHub,
+):
+    import json
+
+    sub = await hub.subscribe()
+
+    hub.dispatch([entry(1)])
+    hub.dispatch_strategy([result_entry(5)])
+    hub.dispatch([entry(2)])
+
+    assert [json.loads(p)["type"] for p in drain(sub.queue)] == ["position", "strategy", "position"]
+
+
+async def test_a_strategy_result_is_serialized_once_and_the_slow_client_policy_is_the_same(
+    hub: RaceHub,
+):
+    one, two = await hub.subscribe(), await hub.subscribe()
+    hub.dispatch_strategy([result_entry(5)])
+    assert one.queue.get_nowait().payload is two.queue.get_nowait().payload
+
+    for lap in range(6, 80):  # 50 de fila: o cliente que não consome é desconectado, como sempre
+        hub.dispatch_strategy([result_entry(lap)])
+        drain(one.queue)
+
+    assert two.overflowed and hub.stats.dropped_slow == 1 and hub.clients == 1
+
+
+async def test_an_unreadable_strategy_entry_is_skipped_and_the_cursor_still_advances(hub: RaceHub):
+    sub = await hub.subscribe()
+
+    hub.dispatch_strategy(
+        [("1-0", {"data": "isto não é json"}), ("2-0", {"v": "1"}), result_entry(7)]
+    )
+
+    assert len(drain(sub.queue)) == 1  # só o legível
+    assert hub._last_strategy_id == "7-0"  # e o hub não ficou preso nas ilegíveis

@@ -561,3 +561,38 @@ def test_track_warnings_use_half_the_field_for_the_previous_lap_and_the_leader_f
     assert [w["code"] for w in track_warnings(leader_only, 30, 0)] == ["virtual_safety_car"]
     assert [w["code"] for w in track_warnings(half_field, 30, 0)] == ["virtual_safety_car"]
     assert track_warnings(few, 30, 0) == []  # um carro em quatro não é a pista
+
+
+# ================================================================ o contrato com a API
+
+
+def test_the_payload_has_exactly_the_fields_the_api_documents_and_validates(race, entries):
+    """O que o consumidor grava e o que o `GET` devolve são o mesmo documento. Um campo novo no
+    payload que a API não conhece seria descartado EM SILÊNCIO na resposta: aqui falha."""
+    from app.schemas import (
+        StrategyBaselineOut,
+        StrategyDriverOut,
+        StrategyForecastOut,
+        StrategyInputsOut,
+        StrategyOut,
+        StrategyWarningOut,
+        UndercutAlertOut,
+    )
+
+    world = replace(WORLD, status_laps={29: "4", 30: "4"})  # com um aviso de pista para validar
+    rows = chase_field(world=world)
+    _, triggers = feed(stream_entries(rows, total_laps=TOTAL), lap_limit=30)
+    c = result_for(next(x for x in triggers if x.lap == 30))
+    pair = next(
+        (a.attacker, a.rival) for a in c.assessments if a.rival and a.probability is not None
+    )
+    p = payload_of(c, alerts={pair})
+
+    StrategyOut.model_validate(p)
+    assert set(p) == set(StrategyOut.model_fields)
+    assert set(p["baseline"]) == set(StrategyBaselineOut.model_fields)
+    assert set(p["forecast"]) == set(StrategyForecastOut.model_fields)
+    assert set(p["forecast"]["drivers"][0]) == set(StrategyDriverOut.model_fields)
+    assert set(p["alerts"][0]) == set(UndercutAlertOut.model_fields)
+    assert set(p["warnings"][0]) == set(StrategyWarningOut.model_fields)
+    assert set(p["inputs"]) == set(StrategyInputsOut.model_fields)

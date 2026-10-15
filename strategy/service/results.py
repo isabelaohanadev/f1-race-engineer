@@ -27,6 +27,8 @@ O GET ESCONDE O QUE É DE REPLAY ANTIGO: `get` compara o epoch do hash com o do 
 estratégia da corrida passada como se fosse a de agora.
 """
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -141,3 +143,12 @@ class ResultStore:
             pipe.hexists(key, f"lap:{lap}")
             stored_epoch, exists = await pipe.execute()
         return int(stored_epoch or 0) == epoch and bool(exists)
+
+
+def strategy_entry_to_json(entry_id: str, fields: Mapping[str, str]) -> str:
+    """A mensagem do WebSocket para uma entrada do stream de resultados: o próprio documento (que já
+    tem `type: "strategy"` e `epoch`) mais o `id` da entrada, como nos outros eventos. Levanta
+    KeyError/ValueError se a entrada não é um resultado legível."""
+    message = json.loads(fields["data"])
+    message["id"] = entry_id
+    return json.dumps(message, separators=(",", ":"), ensure_ascii=False)

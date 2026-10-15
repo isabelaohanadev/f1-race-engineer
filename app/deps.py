@@ -9,6 +9,7 @@ from db.session import get_session_factory
 from replay.control import RedisControlPlane
 from replay.manager import ReplayManager
 from replay.state import RaceStateStore
+from strategy.service.results import ResultStore
 
 
 def get_db() -> Iterator[Session]:
@@ -50,3 +51,8 @@ def get_hubs(connection: HTTPConnection) -> HubRegistry:
 
 def get_state_store(connection: HTTPConnection) -> RaceStateStore:
     return connection.app.state.state_store
+
+
+def get_strategy_store(connection: HTTPConnection) -> ResultStore:
+    """Os resultados de estratégia (só leitura aqui: quem escreve é o consumidor de estratégia)."""
+    return connection.app.state.strategy_store
