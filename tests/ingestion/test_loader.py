@@ -158,6 +158,7 @@ def lap_row(**overrides):
         "TyreLife": 1.0,
         "Stint": 1.0,
         "Position": 11.0,
+        "TrackStatus": "1",
     }
     return row | overrides
 
@@ -229,6 +230,82 @@ def test_build_laps_row_full_of_nulls_still_produces_a_valid_record():
 
     assert (lap.driver_code, lap.lap_number) == ("VER", 1)
     assert (lap.lap_time_ms, lap.completed_at, lap.compound) == (None, None, None)
+
+
+def test_build_laps_flags_pit_in_and_pit_out_laps_from_the_pit_instants():
+    """No GP do Brasil 2024, VER entrou nos boxes na volta 32 e saiu na 33 (bandeira vermelha)."""
+    laps = make_laps(
+        lap_row(LapNumber=31.0),
+        lap_row(LapNumber=32.0, PitInTime=td("0 days 02:00:37.713")),
+        lap_row(LapNumber=33.0, PitOutTime=td("0 days 02:24:06.937"), Stint=2.0),
+    )
+
+    normal, pit_in, pit_out = loader._build_laps(laps, T0)
+
+    assert (normal.pit_in, normal.pit_out) == (False, False)  # False, e NÃO None: o dado existe
+    assert (pit_in.pit_in, pit_in.pit_out) == (True, False)
+    assert (pit_out.pit_in, pit_out.pit_out) == (False, True)
+
+
+def test_build_laps_pit_flag_does_not_depend_on_the_lap_having_a_time():
+    """Metade das voltas de box TEM tempo (17 de 36 de entrada no Brasil): a flag vem do instante
+    de entrada, não de o tempo de volta ser nulo."""
+    laps = make_laps(
+        lap_row(LapTime=td("0 days 00:02:04.967"), PitInTime=td("0 days 02:00:37.713")),
+        lap_row(LapTime=pd.NaT, PitInTime=td("0 days 02:00:37.713")),
+    )
+
+    with_time, without_time = loader._build_laps(laps, T0)
+
+    assert with_time.lap_time_ms == 124967 and with_time.pit_in is True
+    assert without_time.lap_time_ms is None and without_time.pit_in is True
+
+
+@pytest.mark.parametrize("status", ["1", "12", "124", "2671"])
+def test_build_laps_keeps_the_track_status_codes_verbatim(status):
+    lap = loader._build_laps(make_laps(lap_row(TrackStatus=status)), T0)[0]
+
+    # Texto, não número: "124" quer dizer "livre, amarela e SC", não cento e vinte e quatro.
+    assert lap.track_status == status
+
+
+@pytest.mark.parametrize("missing", [None, NAN, ""])
+def test_build_laps_missing_track_status_becomes_none(missing):
+    lap = loader._build_laps(make_laps(lap_row(TrackStatus=missing)), T0)[0]
+
+    assert lap.track_status is None  # "não sei", que a limpeza das voltas trata como descartável
+
+
+def test_build_laps_session_time_is_the_session_clock_in_integer_ms():
+    lap = loader._build_laps(make_laps(lap_row()), T0)[0]
+
+    assert lap.session_time_ms == 4_414_207  # 1:13:34.207, o `Time` da volta
+    assert type(lap.session_time_ms) is int
+
+
+@pytest.mark.parametrize("milliseconds", [64002, 64005, 64008])
+def test_build_laps_session_time_survives_float_representation_error(milliseconds):
+    session_time = pd.Timedelta(milliseconds=milliseconds)
+    assert int(session_time.total_seconds() * 1000) != milliseconds  # a premissa do teste
+
+    lap = loader._build_laps(make_laps(lap_row(Time=session_time)), T0)[0]
+
+    assert lap.session_time_ms == milliseconds
+
+
+def test_build_laps_without_t0_keeps_the_session_clock_but_has_no_absolute_time():
+    """`--laps-only`: sem telemetria não há t0_date, mas o relógio da sessão continua disponível."""
+    lap = loader._build_laps(make_laps(lap_row()), None)[0]
+
+    assert lap.completed_at is None
+    assert lap.session_time_ms == 4_414_207
+    assert lap.lap_time_ms == 99161
+
+
+def test_build_laps_without_session_time_has_neither_clock():
+    lap = loader._build_laps(make_laps(lap_row(Time=pd.NaT)), T0)[0]
+
+    assert (lap.completed_at, lap.session_time_ms) == (None, None)
 
 
 def test_build_laps_converts_every_row_and_keeps_the_order():
@@ -404,6 +481,56 @@ def test_load_race_assembles_race_data_from_the_session(fake_fastf1, tmp_path):
     # NOR perdeu o (0, 0) do começo; #241 não tem inscrição e foi descartado.
     assert [(t.driver_code, t.xs) for t in data.tracks] == [("VER", [10]), ("NOR", [5])]
     session.load.assert_called_once_with(laps=True, telemetry=True, weather=False, messages=False)
+
+
+class DataNotLoaded(Exception):
+    """Faz as vezes do `fastf1.exceptions.DataNotLoadedError`."""
+
+
+class NoTelemetrySession:
+    """Como o `fastf1.core.Session` carregado com `telemetry=False`: `t0_date` e `pos_data` NÃO
+    devolvem nada, LEVANTAM (verificado no FastF1 3.8: o t0_date sai da própria telemetria).
+    O resto é delegado à sessão sintética."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        if name in ("t0_date", "pos_data"):
+            raise DataNotLoaded(name)
+        return getattr(self._inner, name)
+
+
+def test_load_race_laps_only_skips_telemetry_and_never_touches_t0_or_positions(
+    monkeypatch, tmp_path
+):
+    inner = make_session(
+        results=make_results(result_row()),
+        laps=make_laps(lap_row(PitInTime=td("0 days 02:00:37.713"))),
+        pos_data={},
+    )
+    inner.load = Mock()
+    fake = Mock()
+    fake.get_session.return_value = NoTelemetrySession(inner)
+    monkeypatch.setattr(loader, "fastf1", fake)
+
+    data = loader.load_race(2024, 21, str(tmp_path / "cache"), laps_only=True)
+
+    inner.load.assert_called_once_with(laps=True, telemetry=False, weather=False, messages=False)
+    assert data.laps_only is True
+    assert data.tracks == []
+    (lap,) = data.laps
+    assert lap.completed_at is None  # sem t0, sem horário absoluto
+    assert (lap.session_time_ms, lap.lap_time_ms, lap.pit_in) == (4_414_207, 99161, True)
+
+
+def test_load_race_defaults_to_the_full_load_with_telemetry(fake_fastf1, tmp_path):
+    _, session = fake_fastf1
+
+    data = loader.load_race(2024, 21, str(tmp_path / "cache"))
+
+    assert data.laps_only is False
+    assert session.load.call_args.kwargs["telemetry"] is True
 
 
 def test_load_race_asks_fastf1_for_the_race_session_only(fake_fastf1, tmp_path):

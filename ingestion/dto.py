@@ -49,6 +49,12 @@ class LapInfo:
     stint: int | None
     position: int | None
     completed_at: datetime | None  # UTC
+    # Fase 3. Com default `None` ("não sei") para quem monta um LapInfo sem esses dados; o loader
+    # sempre os preenche (True/False e o texto do status).
+    pit_in: bool | None = None  # a volta termina nos boxes
+    pit_out: bool | None = None  # a volta começa nos boxes
+    track_status: str | None = None  # códigos de pista da volta, ex.: "1", "12", "124"
+    session_time_ms: int | None = None  # relógio da sessão no fim da volta (não precisa de t0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,3 +80,8 @@ class RaceData:
     entries: Sequence[EntryInfo]
     laps: Sequence[LapInfo]
     tracks: Sequence[PositionTrack]
+    # True quando a corrida foi carregada SEM telemetria (`--laps-only`): não há t0_date, então os
+    # `completed_at` das voltas vêm nulos por falta de dado, não porque a volta não tenha horário.
+    # O writer então NÃO grava essa coluna, para não apagar horários que uma ingestão completa
+    # anterior já deixou no banco.
+    laps_only: bool = False

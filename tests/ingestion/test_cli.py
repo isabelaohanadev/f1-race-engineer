@@ -25,8 +25,9 @@ def test_main_returns_zero_and_forwards_the_arguments(monkeypatch: pytest.Monkey
         code = cli.main(["--year", "2024", "--round", "21", "--cache-dir", "/tmp/cache"])
 
     assert code == 0
-    ingest.assert_called_once_with(2024, 21, "/tmp/cache")
+    ingest.assert_called_once_with(2024, 21, "/tmp/cache", laps_only=False)
     assert "797642 inseridas de 797642" in caplog.text
+    assert "só voltas" not in caplog.text
 
 
 def test_main_cache_dir_defaults_to_none_so_the_settings_value_applies(monkeypatch):
@@ -35,7 +36,18 @@ def test_main_cache_dir_defaults_to_none_so_the_settings_value_applies(monkeypat
 
     cli.main(["--year", "2024", "--round", "21"])
 
-    ingest.assert_called_once_with(2024, 21, None)
+    ingest.assert_called_once_with(2024, 21, None, laps_only=False)
+
+
+def test_main_laps_only_flag_is_forwarded_and_announced(monkeypatch, caplog):
+    ingest = Mock(return_value=REPORT)
+    monkeypatch.setattr(cli, "ingest_race", ingest)
+
+    with caplog.at_level(logging.INFO, logger="ingestion"):
+        cli.main(["--year", "2024", "--round", "6", "--laps-only"])
+
+    ingest.assert_called_once_with(2024, 6, None, laps_only=True)
+    assert "só voltas" in caplog.text
 
 
 def test_main_returns_one_and_logs_when_the_ingestion_fails(monkeypatch, caplog):

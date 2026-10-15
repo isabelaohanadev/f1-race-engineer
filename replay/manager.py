@@ -87,6 +87,8 @@ class _Run:
     finished: asyncio.Event = field(default_factory=asyncio.Event)  # o motor terminou
     # Comandos `stop` já executados cuja RESPOSTA espera o motor terminar (ver `_execute`).
     stop_replies: list[str] = field(default_factory=list)
+    # Serializa as publicações de status (heartbeat, comandos, supervisor): ver `_publish_status`.
+    status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class ReplayManager:
@@ -242,9 +244,19 @@ class ReplayManager:
         return ReplayInfo(run.engine.status(), run.epoch, self.owner, int(time.time() * 1000))
 
     async def _publish_status(self, run: _Run) -> None:
-        await self._control.publish_status(
-            run.year, run.round_number, run.engine.status(), epoch=run.epoch, owner=self.owner
-        )
+        """Grava o status do replay no plano de controle, de modo que o ÚLTIMO a chegar ao Redis é
+        sempre o mais novo.
+
+        O heartbeat (a cada ~1 s) e o laço de comandos publicam concorrentemente. Se cada um LESSE o
+        status e depois esperasse a escrita, uma leitura velha podia terminar de escrever DEPOIS de
+        uma nova: o `pause` já respondido e o Redis voltando a dizer `running` até o heartbeat
+        seguinte (era o que fazia um teste de integração falhar). A trava serializa as escritas e o
+        status é lido DENTRO dela, imediatamente antes de escrever, então quem escreve depois
+        sempre leu depois."""
+        async with run.status_lock:
+            await self._control.publish_status(
+                run.year, run.round_number, run.engine.status(), epoch=run.epoch, owner=self.owner
+            )
 
     async def _publish_status_quietly(self, run: _Run) -> None:
         try:
@@ -320,8 +332,11 @@ class ReplayManager:
                 result = await self._execute(run, command)
                 if result is None:  # resposta adiada (stop): quem responde é o supervisor
                     continue
-                await self._reply(run, command.id, result)
+                # O status ANTES da resposta (como o `stop` já fazia): quem recebe `paused` e
+                # consulta o status em seguida, de outra instância, tem de achar `paused` e não o
+                # status velho de antes do comando.
                 await self._publish_status_quietly(run)
+                await self._reply(run, command.id, result)
 
     async def _reply(self, run: _Run, command_id: str, result: CommandResult) -> None:
         try:

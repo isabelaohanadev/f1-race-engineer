@@ -36,6 +36,11 @@ LAPS_DTYPES = {
     "Compound": "object",
     "TyreLife": "float64",
     "Position": "float64",
+    # Instantes de SESSÃO em que o carro entrou/saiu dos boxes (nulos nas demais voltas) e a string
+    # de códigos de pista da volta ("1", "12", "124"...). Mesmos dtypes do GP do Brasil 2024.
+    "PitInTime": "timedelta64[ns]",
+    "PitOutTime": "timedelta64[ns]",
+    "TrackStatus": "object",
 }
 
 POS_DTYPES = {"Date": "datetime64[ns]", "X": "float64", "Y": "float64"}

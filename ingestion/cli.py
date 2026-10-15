@@ -19,6 +19,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-dir", default=None, help="cache do FastF1 (default: FASTF1_CACHE_DIR do ambiente)"
     )
     parser.add_argument(
+        "--laps-only",
+        action="store_true",
+        help="só voltas e resultado, sem a telemetria de posição (segundos em vez de minutos; "
+        "a corrida fica sem trajetória, e as posições que já estiverem no banco não são tocadas)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="logs detalhados (inclui FastF1)"
     )
     return parser
@@ -35,10 +41,15 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger("fastf1").setLevel(logging.WARNING)
 
     log = logging.getLogger("ingestion")
-    log.info("Ingerindo %s, etapa %s ...", args.year, args.round_number)
+    log.info(
+        "Ingerindo %s, etapa %s%s ...",
+        args.year,
+        args.round_number,
+        " (só voltas)" if args.laps_only else "",
+    )
     started = time.perf_counter()
     try:
-        report = ingest_race(args.year, args.round_number, args.cache_dir)
+        report = ingest_race(args.year, args.round_number, args.cache_dir, laps_only=args.laps_only)
     except Exception:
         log.exception("Ingestão falhou; nada foi gravado (a transação sofreu rollback).")
         return 1

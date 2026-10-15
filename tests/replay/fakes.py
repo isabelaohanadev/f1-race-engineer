@@ -64,6 +64,9 @@ class FakeControl:
         self.statuses: list[tuple[ReplayStatus, int, str]] = []
         self.replies: dict[str, CommandResult] = {}
         self.log: list[tuple[str, str]] = []  # ("status", estado) / ("reply", id), em ordem
+        # O ÚLTIMO status publicado no instante em que cada resposta saiu: é o que outra instância
+        # da API lê se perguntar o status logo depois de receber a resposta.
+        self.status_at_reply: dict[str, ReplayStatus | None] = {}
         self._commands: asyncio.Queue[Command] = asyncio.Queue()
         self._ids = itertools.count(1)
 
@@ -88,6 +91,7 @@ class FakeControl:
         self, year: int, round_number: int, command_id: str, result: CommandResult
     ) -> None:
         self.replies[command_id] = result
+        self.status_at_reply[command_id] = self.statuses[-1][0] if self.statuses else None
         self.log.append(("reply", command_id))
 
     # ---- lado do teste
@@ -99,6 +103,52 @@ class FakeControl:
     @property
     def last_status(self) -> ReplayStatus:
         return self.statuses[-1][0]
+
+
+class GatedControl(FakeControl):
+    """Um FakeControl cuja PRÓXIMA publicação de status fica "no ar" até o teste soltá-la.
+
+    É a latência do Redis sob controle: o status já foi LIDO (vem como argumento), a escrita ainda
+    não chegou ao servidor. Sem isso, reproduzir "a escrita velha chega depois da nova" dependeria
+    de sorte de agendamento, que é exatamente o que fazia o teste real falhar de vez em quando."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._armed: asyncio.Event | None = None  # a próxima publicação vai esperar por este
+        self._held: asyncio.Event | None = None  # o portão da publicação que está no ar agora
+        self.in_flight = False
+
+    def hold_next_publish(self) -> None:
+        self._armed = asyncio.Event()
+
+    def release(self) -> None:
+        """Solta a publicação que está no ar (ou, se ainda não chegou, a que vai chegar)."""
+        gate = self._held or self._armed
+        assert gate is not None, "não há publicação armada nem no ar"
+        gate.set()
+
+    async def publish_status(
+        self, year: int, round_number: int, status: ReplayStatus, *, epoch: int, owner: str
+    ) -> None:
+        gate, self._armed = self._armed, None  # só a PRIMEIRA publicação depois de armar
+        if gate is not None:
+            self._held, self.in_flight = gate, True
+            await gate.wait()
+            self._held, self.in_flight = None, False
+        await super().publish_status(year, round_number, status, epoch=epoch, owner=owner)
+
+
+class TickSleep:
+    """O `sleep` do heartbeat sob controle do teste: cada `tick()` libera exatamente UMA espera."""
+
+    def __init__(self) -> None:
+        self._ticks: asyncio.Queue[None] = asyncio.Queue()
+
+    async def __call__(self, _seconds: float) -> None:
+        await self._ticks.get()
+
+    def tick(self) -> None:
+        self._ticks.put_nowait(None)
 
 
 class FakePublisher:

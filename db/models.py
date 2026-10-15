@@ -123,6 +123,26 @@ class Lap(Base):
     # Instante absoluto em que a volta terminou: é o que permite ao replay (Fase 2) intercalar
     # voltas e posições na ordem correta de tempo.
     completed_at: Mapped[datetime | None]
+    # Relógio da SESSÃO (ms desde o início dos dados do FastF1) no fim da volta. É o mesmo relógio
+    # para todos os pilotos, então `session_time_ms(A) - session_time_ms(B)` na mesma volta é o
+    # intervalo entre A e B na linha de chegada, que é o que o undercut e a simulação precisam.
+    # Existe separado de `completed_at` porque o horário absoluto (`t0_date + Time`) só se calcula
+    # com a telemetria carregada, e a ingestão `--laps-only` não a carrega.
+    session_time_ms: Mapped[int | None]
+    # Fase 3 (estratégia): o que o modelo de pneu precisa para saber QUAIS voltas representam o
+    # ritmo real do carro. Os três abaixo são NULOS (e não "falso"/vazio) quando a volta foi gravada
+    # antes de existirem: ausência de informação não é informação de ausência, e a limpeza das
+    # voltas trata nulo como "não sei" e descarta, em vez de assumir "pista livre, sem box".
+    #   pit_in:  a volta TERMINA nos boxes (volta de entrada, lenta por definição);
+    #   pit_out: a volta COMEÇA nos boxes (volta de saída, também lenta e com pneu frio).
+    #   Medido no GP do Brasil 2024: metade dessas voltas tem tempo de volta registrado (17 de 36 de
+    #   entrada, 16 de 35 de saída), então "descartar voltas sem tempo" NÃO as remove.
+    pit_in: Mapped[bool | None]
+    pit_out: Mapped[bool | None]
+    # Códigos de status de pista ocorridos durante a volta, concatenados como o FastF1 os entrega:
+    # "1" livre, "2" amarela, "4" safety car, "5" bandeira vermelha, "6" VSC, "7" fim do VSC. Uma
+    # volta pode misturar vários ("124"), por isso é texto e não um número.
+    track_status: Mapped[str | None] = mapped_column(String(16))
 
     __table_args__ = (
         # ÍNDICE (a própria PK): (race_id, driver_id, lap_number) atende "todas as voltas da
