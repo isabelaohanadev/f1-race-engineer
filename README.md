@@ -532,6 +532,7 @@ configurável por `WORKER_METRICS_PORT`, `0` desliga) e o consumidor de estraté
 | `f1_strategy_simulation_duration_seconds{result}` | histograma | estratégia | Duração da simulação (`completed`, `cancelled`, `stale`, `failed`) |
 | `f1_strategy_laps_total{outcome}` | counter | estratégia | Voltas lidas: `applied`, `duplicate`, `late`, `stale_epoch`, `status`, `ignored`, `malformed` |
 | `f1_strategy_results_total{outcome}` | counter | estratégia | Entregas: `written`, `exists`, `fenced`, `skipped`, `dropped` |
+| `f1_strategy_gap_rebuilds_total` | counter | estratégia | Lotes com lacuna (outro consumidor do grupo levou entradas): deve ser 0 |
 
 Detalhes que importam:
 
@@ -606,7 +607,9 @@ pytest                            # tudo; requer banco e Redis (docker compose u
   processos e um servidor `uvicorn` **real** com clientes WebSocket reais entrando no meio de um
   replay. O consumidor de estratégia tem os dele contra o Redis real: a queda com um `SIGKILL` de
   verdade, o lock e o standby, o epoch, a duplicata, o embaralhamento e a cadeia inteira (banco,
-  replay, consumidor, hub, WebSocket e `GET`).
+  replay, consumidor, hub, WebSocket e `GET`), mais os cantos: três instâncias, o lock que se perde
+  e volta, falhas do Redis injetadas no cliente, entradas ilegíveis e um processo congelado
+  (`SIGSTOP`) que acorda.
 - Sem banco/Redis acessível, os de integração são **pulados** com a instrução de como subir; com
   `REQUIRE_INTEGRATION_DB=1` (o que o CI usa) eles **falham**, para nunca passarem em silêncio.
 - **Por que Redis real, e não `fakeredis` ou `testcontainers`:** o que precisa de prova (Lua,

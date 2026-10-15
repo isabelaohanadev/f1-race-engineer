@@ -20,6 +20,16 @@ posicionado no fim do que foi lido (`XGROUP SETID`) e as pendências de quem mor
 (já estão no estado). Se a ativa morreu entre receber a volta N e gravar o resultado, a que assume
 calcula a última volta no mesmo instante, a menos que o resultado já esteja lá.
 
+O GRUPO É COMPARTILHADO, E ISSO TEM UM BURACO QUE O CÓDIGO FECHA. Uma instância ativa que ficou
+congelada além do TTL (o "zumbi") pode acordar e ler do grupo ANTES de perceber que perdeu o lock:
+as entradas que ela lê são entregues a ELA, e a nova ativa nunca as vê (o `>` do grupo entrega cada
+entrada a um consumidor só). Sem nada, o estado da nova ativa ficaria com um buraco, em silêncio.
+Por isso cada lote lido confere a continuidade: entre o último ID que esta instância aplicou e o
+primeiro do lote não pode haver entrada nenhuma no stream (`XRANGE` exclusivo nos dois lados). Se
+houver, o estado da corrida é reconstruído do stream (a fonte da verdade), a contagem
+`gap_rebuilds` sobe e o aviso vai ao log. Um resultado já calculado com o estado incompleto NÃO é
+refeito: o primeiro a chegar ao armazém vence.
+
 O QUE NÃO SE RECUPERA numa troca de instância: a histerese do alerta de undercut (um par que estava
 "ligado" a 0,55 recomeça "desligado") e o cálculo que estava em voo (a que assume refaz a última
 volta, e o primeiro a chegar ao armazém vence).
@@ -89,6 +99,7 @@ class ConsumerStats:
     leaderships: int = 0  # quantas vezes esta instância assumiu o lock
     lost_lock: int = 0
     rebuilt: int = 0  # corridas reconstruídas do stream
+    gap_rebuilds: int = 0  # reconstruções por lacuna: outro consumidor do grupo levou entradas
     submitted: int = 0
     written: int = 0
     exists: int = 0
@@ -112,6 +123,7 @@ class RaceRuntime:
     alerts: AlertTracker
     runner: LatestOnlyRunner
     constants_task: asyncio.Task[Constants] | None = None
+    last_id: str = "0-0"  # o último ID do stream de voltas já aplicado ao estado
 
 
 class StrategyConsumer:
@@ -345,6 +357,7 @@ class StrategyConsumer:
             cursor = f"({page[-1][0]}"
         if last_id is None:
             return
+        runtime.last_id = last_id
         await self._settle_group(runtime.stream, last_id)
         if runtime.tracker.finished:
             return  # uma corrida que já acabou: não há "última volta" a calcular agora
@@ -368,8 +381,29 @@ class StrategyConsumer:
 
     # ------------------------------------------------------------ entradas e disparos
 
+    async def _has_gap(self, runtime: RaceRuntime, first_id: str) -> bool:
+        """Há alguma entrada no stream entre a última que esta instância aplicou e a primeira do
+        lote? Se há, outro consumidor do grupo as levou."""
+        between = await self._redis.xrange(
+            runtime.stream, min=f"({runtime.last_id}", max=f"({first_id}", count=1
+        )
+        return bool(between)
+
     async def _process(self, stream: str, messages: list[tuple[str, dict[str, str]]]) -> None:
         runtime = self._by_stream[stream]
+        if await self._has_gap(runtime, messages[0][0]):
+            logger.warning(
+                "Faltam entradas de %s entre %s e %s (outro consumidor do grupo as levou): "
+                "reconstruindo o estado do stream",
+                stream,
+                runtime.last_id,
+                messages[0][0],
+            )
+            self.stats.gap_rebuilds += 1
+            metrics.GAP_REBUILDS.inc()
+            runtime.tracker = RaceTracker(runtime.year, runtime.round, wait_s=self._wait_s)
+            await self._rebuild(runtime)  # lê tudo, também este lote, e posiciona o grupo
+            return
         now = self._clock()
         for entry_id, fields in messages:
             try:
@@ -382,6 +416,7 @@ class StrategyConsumer:
             metrics.LAPS.labels(applied.outcome.value).inc()
             if applied.new_epoch:
                 await self._new_replay(runtime)
+        runtime.last_id = messages[-1][0]
         # A confirmação vem depois de aplicar ao estado em memória: é barato e síncrono. Se a
         # instância morrer antes, quem assume reconstrói tudo do stream (não depende do grupo).
         await self._redis.xack(stream, STRATEGY_GROUP, *[entry_id for entry_id, _ in messages])

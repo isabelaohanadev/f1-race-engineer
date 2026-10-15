@@ -83,6 +83,12 @@ DELIVERIES = Counter(
     ["outcome"],
     registry=REGISTRY,
 )
+GAP_REBUILDS = Counter(
+    "f1_strategy_gap_rebuilds_total",
+    "Vezes em que o consumidor ativo achou entradas do stream de voltas que outro consumidor do "
+    "grupo tinha levado (um zumbi que acordou) e reconstruiu o estado do stream. Deve ser 0.",
+    registry=REGISTRY,
+)
 CONSUMER_ACTIVE = Gauge(
     "f1_strategy_consumer_active",
     "1 se esta instância do consumidor de estratégia segura o lock e calcula; 0 se está em "
