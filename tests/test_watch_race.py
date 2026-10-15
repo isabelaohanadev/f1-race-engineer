@@ -91,3 +91,62 @@ def test_classification_orders_by_laps_then_by_who_crossed_first_and_unlapped_la
         view.apply_event(event)
 
     assert view.classification == ["HAM", "NOR", "VER", "ALB"]
+
+
+def strategy(lap_number: int, *, epoch: int = 1, version: int = 1, favorite: str = "NOR") -> dict:
+    drivers = [{"driver": favorite, "win": 0.55, "baseline_win": 0.0}]
+    return {
+        "type": "strategy", "epoch": epoch, "v": version, "lap": lap_number,
+        "reliability": "indicative", "baseline": {"leader": "VER"},
+        "forecast": {"drivers": drivers},
+    }  # fmt: skip
+
+
+def test_the_strategy_with_the_highest_lap_of_the_epoch_wins_whatever_the_arrival_order():
+    view = RaceView()
+
+    for message in (strategy(12), strategy(10), strategy(12), strategy(11)):  # fora de ordem
+        view.apply_event(message)
+
+    assert view.strategy is not None and view.strategy["lap"] == 12
+
+
+def test_a_strategy_of_an_older_replay_is_ignored_and_a_newer_one_replaces_the_old():
+    view = RaceView()
+    view.apply_event(strategy(20, epoch=2))
+
+    view.apply_event(strategy(40, epoch=1))  # de um replay que já passou
+    assert view.strategy is not None and view.strategy["epoch"] == 2
+
+    view.apply_event(strategy(5, epoch=3))  # replay novo: a estratégia do anterior não vale
+    assert view.strategy is not None and (view.strategy["epoch"], view.strategy["lap"]) == (3, 5)
+
+
+def test_a_strategy_of_a_version_the_client_does_not_know_is_reported_not_guessed():
+    view = RaceView()
+    view.apply_event(strategy(10))
+
+    view.apply_event(strategy(11, version=2))
+
+    assert view.strategy is not None and view.strategy["lap"] == 10  # o último que entendia
+    assert view.strategy_unsupported == 2
+
+
+def test_the_strategy_of_the_previous_replay_is_dropped_when_a_snapshot_of_another_epoch_arrives():
+    view = RaceView()
+    view.apply_event(strategy(10, epoch=1))
+
+    view.apply_snapshot({"epoch": 2, "race": {}, "cars": {}})
+
+    assert view.strategy is None
+
+
+def test_the_terminal_summary_shows_the_monte_carlo_beside_the_current_leader():
+    from scripts.watch_race import describe
+
+    view = RaceView()
+    view.apply_event(strategy(12))
+
+    line = describe(view)
+
+    assert "Monte Carlo NOR 55% x líder atual VER 100%" in line and "indicative" in line

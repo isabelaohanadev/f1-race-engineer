@@ -8,6 +8,9 @@ const results = scenarios.map(({ snapshot, events }) => {
   const view = new RaceView();
   if (snapshot) view.applySnapshot(snapshot);
   for (const event of events) view.applyEvent(event);
-  return { epoch: view.epoch, race: view.race, cars: view.cars, classification: view.classification() };
+  return {
+    epoch: view.epoch, race: view.race, cars: view.cars, classification: view.classification(),
+    strategy: view.strategy, strategyUnsupported: view.strategyUnsupported,
+  };
 });
 process.stdout.write(JSON.stringify(results));

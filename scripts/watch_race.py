@@ -18,6 +18,11 @@ suíte de testes o reutiliza: o exemplo que você copia é o mesmo que os testes
 * Por piloto, uma POSIÇÃO só vale se `t` > `pos_t` do que você já tem; uma VOLTA, se `t` > `lap_t`.
 * O status da corrida só avança em (volta, estado): started < running < finished.
 * A classificação é derivada: mais voltas completas primeiro; empatando, quem cruzou a linha antes.
+* O evento `strategy` (Fase 3) traz o resultado de estratégia da volta do líder. Vale o de MAIOR
+  `lap` do epoch atual (o que chega repetido ou fora de ordem não volta atrás) e só se `v` é uma
+  versão que o cliente conhece (`STRATEGY_VERSION`): uma versão nova fica em
+  `strategy_unsupported`, e o cliente deve dizê-lo em vez de adivinhar. Mostre SEMPRE `baseline_win`
+  ao lado de `win`: no backtest o Monte Carlo não superou "o líder atual vence" (docs/backtest.md).
 """
 
 import argparse
@@ -31,6 +36,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 STATE_RANK = {"started": 0, "running": 1, "finished": 2}
+STRATEGY_VERSION = 1  # a versão do formato do evento `strategy` que este cliente entende
 CLOSE_TOO_SLOW = (
     1013  # o servidor desconecta quem não acompanha: reconecte e receba um snapshot novo
 )
@@ -43,8 +49,12 @@ class RaceView:
         self.epoch = 0
         self.race: dict[str, Any] = {}
         self.cars: dict[str, dict[str, Any]] = {}
+        self.strategy: dict[str, Any] | None = None
+        self.strategy_unsupported: int | None = None  # a versão que o cliente não conhece
 
     def apply_snapshot(self, message: dict[str, Any]) -> None:
+        if self.strategy is not None and self.strategy["epoch"] != message["epoch"]:
+            self.strategy = None  # o resultado era de outro replay
         self.epoch = message["epoch"]
         self.race = dict(message["race"])
         self.cars = {code: dict(car) for code, car in message["cars"].items()}
@@ -54,7 +64,13 @@ class RaceView:
             return  # evento de um replay antigo
         if message["epoch"] > self.epoch:
             self.epoch, self.race, self.cars = message["epoch"], {}, {}  # replay novo
+            self.strategy = self.strategy_unsupported = None
         match message["type"]:
+            case "strategy":
+                if message["v"] != STRATEGY_VERSION:
+                    self.strategy_unsupported = message["v"]
+                elif self.strategy is None or message["lap"] > self.strategy["lap"]:
+                    self.strategy = message
             case "position":
                 car = self.cars.setdefault(message["driver"], {})
                 if car.get("pos_t", -1) < message["t"]:
@@ -91,9 +107,18 @@ class RaceView:
 def describe(view: RaceView) -> str:
     lap, total = view.race.get("lap", "-"), view.race.get("total_laps", "?")
     top = " ".join(view.classification[:5]) or "-"
-    return (
+    line = (
         f"volta {lap}/{total} {view.race.get('state', '-')} | {len(view.cars)} carros | top5: {top}"
     )
+    if view.strategy is not None:
+        favorite = view.strategy["forecast"]["drivers"][0]
+        leader = view.strategy["baseline"]["leader"]
+        # O Monte Carlo SEMPRE ao lado do comparador: no backtest ele não superou "o líder atual".
+        line += (
+            f" | estratégia (volta {view.strategy['lap']}, {view.strategy['reliability']}): "
+            f"Monte Carlo {favorite['driver']} {favorite['win']:.0%} x líder atual {leader} 100%"
+        )
+    return line
 
 
 async def watch(url: str, *, show_events: bool, duration: float | None) -> int:
