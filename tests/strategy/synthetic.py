@@ -46,6 +46,10 @@ class World:
     noise: float = 0.15
     seed: int = 0
     status_laps: dict[int, str] = field(default_factory=dict)  # volta -> status (para todos)
+    # Sob Safety Car (status "4"): a volta de todos vai a `sc_factor` vezes o ritmo, e as sobretaxas
+    # da entrada e da saída dos boxes valem `sc_pit_factor` vezes (a parada "barata").
+    sc_factor: float = 1.0
+    sc_pit_factor: float = 1.0
 
 
 def build_race(plans: list[Plan], world: World | None = None) -> list[LapRow]:
@@ -70,7 +74,12 @@ def build_race(plans: list[Plan], world: World | None = None) -> list[LapRow]:
                 + rng.normal(0, noise)
             )
             pit_in = n in stops
-            seconds = pace + (world.in_extra if pit_in else 0) + (world.out_extra if pit_out else 0)
+            under_sc = "4" in world.status_laps.get(n, "1")
+            pit_scale = world.sc_pit_factor if under_sc else 1.0
+            seconds = pace * (world.sc_factor if under_sc else 1.0)
+            seconds += pit_scale * (
+                (world.in_extra if pit_in else 0) + (world.out_extra if pit_out else 0)
+            )
             laps.append((n, seconds, compound, age, stint, pit_in, pit_out))
             next_compound = stops[n] if pit_in else None
             age += 1

@@ -753,6 +753,33 @@ Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
   eventos, ambos sob pista não verde: a amostra limpa por corrida é pequena, e o relatório mostra o `n`
   de cada faixa.
 
+#### Safety Car, abandonos e trocas de composto: o que medi (e o que é pouco)
+
+Para o Monte Carlo (`strategy/history.py`, números em `docs/safety-car.md`), sempre **sem a corrida
+avaliada**:
+
+- **O SC é um evento da corrida, não uma taxa por volta.** O número de SCs é Poisson(`lambda`); o início
+  sai das frações históricas da corrida e a duração das durações históricas. Na volta N os que faltam
+  são Poisson(`lambda * (1 - F(N))`). A incerteza de `lambda` (Gamma posteriori) entra em **cada
+  simulação**: a incerteza da taxa vira incerteza da probabilidade de vitória.
+- **Pouquíssimos dados.** Nas 21 corridas secas há **8 períodos de SC em 7 corridas**, e **5 deles nas
+  voltas 1 a 7** (incidentes de largada): o SC depois da volta 10 vem de **3 eventos**. (Os "9" que
+  circularam eram corridas com SC entre as 24, contando as 2 molhadas, que ficam fora.)
+- **O que o SC faz foi medido, não suposto:** a volta sob SC leva 1,49x a verde (1,23 a 1,62 por
+  corrida, 4 corridas), os carros do pelotão ficam a ~1,9 s uns dos outros, e a parada custa ~0,58x a
+  verde.
+- **Por que a perda da parada sob SC é medida contra o campo.** Contra o ritmo próprio a parada sob SC
+  *parece mais cara* (todo o campo anda devagar, só o piloto que para perde posição). O certo é o tempo
+  de entrada+saída do piloto menos o dos carros que não pararam nas mesmas voltas. Em bandeira verde
+  esse método dá 22,6 s (n=530), o mesmo da perda no pit, o que o valida; sob SC dá 13,2 s com **n=15** e
+  muita dispersão (de -27 a +112 s): a razão 0,58 tem um desvio de ~0,4.
+- **Fora do simulador, e dito:** VSC (8 períodos) e bandeira vermelha (2, as duas na volta 1). O
+  **desgaste do pneu sob SC** é uma heurística declarada no simulador (não se mede desgaste num tempo de
+  volta sob SC).
+- **Abandono:** 41 em 419 largadas (9,8% por piloto-corrida); só o status `Retired` conta
+  (desqualificação não é abandono). Mesmo desenho do SC: probabilidade e fração da corrida, das outras
+  corridas.
+
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
 
@@ -900,7 +927,7 @@ replay/         motor de replay: fonte (keyset), timeline, engine, publisher, es
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
 strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo,
-                undercut e a avaliação dele (undercut_eval)
+                undercut e a avaliação dele (undercut_eval), history (SC, abandonos, compostos)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
