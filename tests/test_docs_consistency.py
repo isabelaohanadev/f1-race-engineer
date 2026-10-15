@@ -49,3 +49,44 @@ def test_the_live_evaluation_lists_no_post_result_adjustment_and_keeps_the_froze
     assert "## Ajustes pós-resultado Nenhum." in text
     assert "o congelado (1.30)" in text  # o fator em uso é o congelado
     assert "Diagnóstico, não aplicado" in text
+
+
+def readme() -> str:
+    return (ROOT / "README.md").read_text()
+
+
+def test_the_backtest_results_come_before_the_limitations_and_say_the_bad_news_plainly():
+    text = readme()
+    results = text.index("## Resultados do backtest")
+
+    assert results < text.index("## Limitações conhecidas")
+    section = " ".join(text[results : text.index("## Limitações conhecidas")].split())
+    assert "O resultado é ruim" in section
+    assert (
+        "Não supera em nenhuma das 10 faixas" in section
+        or "**Não.** Não supera em nenhuma" in section
+    )
+    assert "pior depois de 80%" in section
+    assert "baseline_win" in section and "reliability" in section
+
+
+def test_the_opening_of_the_readme_already_says_the_monte_carlo_does_not_beat_the_leader():
+    opening = " ".join(readme()[: readme().index("## Arquitetura")].split())
+
+    assert "não supera" in opening and "pior depois de 80% da corrida" in opening
+
+
+def test_the_full_flow_diagram_has_both_tracks_from_the_database_to_the_client():
+    text = readme()
+    start = text.index("### O fluxo completo")
+    diagram = text[start : text.index("### Como um cliente entra no meio do replay")]
+
+    for piece in (
+        "TimescaleDB", "ReplayEngine", "StreamPublisher", "Stream race:ano:etapa",
+        "Stream laps:ano:etapa", "worker", "state-workers", "Hash state:ano:etapa",
+        "strategy: 2 cópias, 1 ativa", "strategy:consumer:lock", "strategy:result:ano:etapa",
+        "strategy:events:ano:etapa", "Hub por corrida", "WebSocket",
+        "GET /races/ano/etapa/strategy", "standby", "cada lap_completed",
+    ):  # fmt: skip
+        assert piece in diagram, piece
+    assert diagram.count("```mermaid") == 1

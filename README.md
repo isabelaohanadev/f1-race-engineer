@@ -13,6 +13,11 @@ voltas e 20 pilotos entram no banco em cerca de 1 minuto (e reingerir **não alt
 O replay lê essas 797 mil linhas com **~4 MB de memória** (em vez de ~270 MB) e entrega eventos ao
 cliente com latência de poucos milissegundos.
 
+A **Fase 3** acrescenta a estratégia sobre esse replay: degradação de pneu, alerta de undercut e uma
+simulação Monte Carlo de vitória e pódio, atualizadas a cada volta do líder. **O backtest mostrou
+que o Monte Carlo não supera "o líder atual vence" e é pior depois de 80% da corrida**
+(ver "Resultados do backtest"): o sistema mostra as duas probabilidades lado a lado.
+
 > Projeto independente de portfólio. Sem vínculo com a Formula 1; usa dados públicos via FastF1.
 
 **Stack:** Python 3.12 · FastAPI (REST + WebSocket) · SQLAlchemy 2.0 + Alembic · PostgreSQL 16 +
@@ -23,54 +28,84 @@ Compose · GitHub Actions
 
 ### O fluxo completo
 
+Duas trilhas saem do mesmo motor de replay: a do **estado e do WebSocket** (posições, voltas e
+status, mantidos pelos workers) e a da **estratégia** (cada `lap_completed` vai também para um stream
+de voltas, de onde o consumidor de estratégia calcula e grava um resultado que a API serve pelo
+WebSocket e pelo `GET`).
+
 ```mermaid
 flowchart LR
     DB[("TimescaleDB<br/>position_samples (hypertable)<br/>laps, races, drivers...")]
 
     subgraph API1 ["API: instância dona do replay"]
         direction TB
-        SRC["RaceSource<br/>leitura por keyset (time, driver_id)<br/>páginas de 5.000 + prefetch"]
+        SRC["RaceSource<br/>leitura por keyset (time, driver_id)<br/>páginas de 5.000 + prefetch<br/>voltas com session_time_ms, pneu, box"]
         ENG["ReplayEngine<br/>ritmo por âncora monotônica<br/>1x, 4x, 16x e pausa"]
-        PUB["StreamPublisher<br/>XADD MAXLEN ~ 100.000<br/>lotes em MULTI/EXEC"]
+        PUB["StreamPublisher<br/>uma transação MULTI/EXEC<br/>XADD nos dois streams"]
         SRC --> ENG --> PUB
     end
 
     subgraph REDIS ["Redis"]
         direction TB
-        STREAM[/"Stream race:ano:etapa<br/>toda entrada leva o epoch do replay"/]
+        STREAM[/"Stream race:ano:etapa<br/>posições, voltas e status<br/>toda entrada leva o epoch do replay"/]
+        LAPS[/"Stream laps:ano:etapa<br/>só lap_completed e started/finished<br/>com os campos da estratégia"/]
         STATE[("Hash state:ano:etapa<br/>VER:x, VER:lap, race:lap ...")]
         CTL[("Plano de controle<br/>status, comandos e lock do replay")]
+        RES[("Hash strategy:result:ano:etapa<br/>epoch, latest, lap:N (JSON v1)")]
+        EVT[/"Stream strategy:events:ano:etapa<br/>um por resultado novo"/]
+        LOCK[("Lock strategy:consumer:lock")]
     end
 
-    subgraph WORKERS ["Workers: N cópias no grupo compartilhado state-workers"]
+    subgraph WORKERS ["worker: N cópias no grupo state-workers"]
         direction TB
         W["XREADGROUP, script Lua, XACK<br/>o Lua só grava se a versão for maior<br/>XAUTOCLAIM resgata pendências"]
     end
 
+    subgraph STRAT ["strategy: 2 cópias, 1 ativa"]
+        direction TB
+        ACT["ATIVA (segura o lock), grupo strategy<br/>dedupe por piloto e volta, janela de espera<br/>state_until, Monte Carlo e undercut<br/>numa thread, só a última simulação"]
+        STB["standby<br/>assume pelo TTL e reconstrói<br/>o estado do stream de voltas"]
+    end
+
     subgraph API2 ["Qualquer instância da API"]
         direction TB
-        HUB["Hub por corrida<br/>XREAD sem grupo"]
+        HUB["Hub por corrida<br/>um XREAD, dois streams"]
         FILA["Fila limitada por cliente<br/>cheia: fecha com 1013"]
-        WS["WebSocket<br/>/ws/races/ano/etapa"]
+        WS["WebSocket<br/>/ws/races/ano/etapa<br/>snapshot, eventos e strategy"]
+        GET["GET /races/ano/etapa/strategy<br/>só lê"]
         HUB --> FILA --> WS
     end
 
     DB --> SRC
+    DB -->|"constantes sem a corrida"| ACT
     PUB --> STREAM
-    PUB -.->|"DEL do stream e lock"| CTL
+    PUB -->|"cada lap_completed"| LAPS
+    PUB -.->|"DEL dos streams e lock"| CTL
     STREAM --> W
     W --> STATE
+    LAPS --> ACT
+    LAPS -.-> STB
+    LOCK -.-> ACT
+    ACT --> RES
+    ACT --> EVT
     STREAM --> HUB
+    EVT --> HUB
     STATE -->|"snapshot e marca d'água"| WS
     STREAM -->|"catch-up com XRANGE"| WS
+    RES -->|"o último, ao conectar"| WS
+    RES --> GET
     WS --> CLI(["cliente<br/>navegador, websocat ou script"])
+    GET --> CLI
 ```
 
-Duas ideias sustentam o desenho. **O estado mora no Redis**, não na memória de um worker: assim
+Três ideias sustentam o desenho. **O estado mora no Redis**, não na memória de um worker: assim
 vários workers dividem a carga e qualquer instância da API consegue montar um snapshot.
 **A consistência vem do dado, não da ordem**: cada atualização carrega uma versão (o tempo de
 corrida) e um *epoch* (o número do replay), então o resultado final é o mesmo qualquer que seja a
-ordem em que os workers processem os eventos, e reprocessar um evento é inofensivo.
+ordem em que os workers processem os eventos, e reprocessar um evento é inofensivo. E **a
+estratégia lê um stream só de voltas**, em vez de filtrar as posições (~99% do stream principal), e
+só **uma** instância calcula por vez: quem assume reconstrói o estado desse stream, que guarda a
+corrida inteira.
 
 ### Como um cliente entra no meio do replay, sem buracos
 
@@ -1026,6 +1061,29 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   dentro do stint, 0 relógios que não crescem e 0 discordâncias entre tempo de volta e relógio da
   sessão ou entre posição e ordem de chegada (as checagens têm testes que plantam o defeito).
 
+## Resultados do backtest
+
+Relatório completo e gerado dos números: `docs/backtest.md` (protocolo congelado **antes** de rodar,
+21 corridas secas de 2024, leave-one-race-out; a britânica, o Canadá e o Brasil à parte).
+**O resultado é ruim, e está aqui como é.**
+
+| Pergunta | Resultado |
+|---|---|
+| O Monte Carlo prevê o vencedor melhor que "o líder atual vence"? | **Não.** Não supera em nenhuma das 10 faixas da corrida (em 8 não se distingue; com 21 corridas não dá para dizer quem é melhor), e **é pior depois de 80%**: diferença de Brier de +0,151 [0,002; 0,314] em 80%-90% e +0,085 [0,014; 0,175] em 90%-100%. No geral, 0,541 contra 0,425. |
+| O modelo do tempo de volta supera a persistência? | **Não**, em nenhum dos 5 horizontes (1 volta à frente: erra 0,441 s contra 0,397 s). |
+| A probabilidade está calibrada? | Razoável onde há dado (a tabela do relatório traz o `n` de cada faixa); acima de 0,5 são poucos pares. |
+| As variantes do coeficiente de combustível e a taxa de Safety Car importam? | Não se distinguem nesta amostra (não é prova de que não importam, só de que 21 corridas não as separam). |
+| O alerta de undercut acerta? | O backtest mediu a **forma antiga** (o instante do atacante). A forma que roda ao vivo (o instante do líder) foi medida à parte em `docs/undercut-ao-vivo.md`: o líder nunca é o rival, a amostra é de dezenas de eventos, só entram as paradas que aconteceram (precisão otimista) e ela erra mais que a forma antiga nos mesmos eventos. |
+
+**O que isso muda no sistema:** cada resultado de estratégia traz a probabilidade do comparador "o
+líder atual vence" **ao lado** da do Monte Carlo (`baseline_win`), as voltas que faltam e
+`reliability` (`indicative` até 80% da corrida, `experimental` depois), e a página mostra a ressalva
+sempre. **Não use a probabilidade de vitória do Monte Carlo como previsão melhor que a posição na
+pista.** O que está aqui é o encanamento (o replay, o consumidor, a API) e a medição honesta; não
+há prova de que o modelo ajude, e o diagnóstico posterior (`docs/backtest-diagnostico.md`) aponta o
+ponto do modelo, não a dispersão, como fonte do problema: é uma hipótese, nenhuma correção foi
+aplicada.
+
 ## Limitações conhecidas
 
 **Estratégia (Fase 3, até aqui):**
@@ -1124,8 +1182,9 @@ strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustí
                 snapshot (o estado até o instante t), undercut e a avaliação dele (undercut_eval),
                 history (SC, abandonos, compostos), montecarlo, forecast_runner (executor
                 só-a-última), forecast_eval, laptime_eval, protocol (as constantes congeladas),
-                backtest e backtest_report, diagnostics (pós-resultado), metrics, live (o estado ao
-                vivo de uma corrida, puro) e payload (o resultado versionado)
+                backtest e backtest_report, diagnostics (pós-resultado), undercut_live (o alerta na
+                forma ao vivo, offline), metrics, live (o estado ao vivo de uma corrida, puro) e
+                payload (o resultado versionado)
 strategy/service/  o consumidor de estratégia (Redis, lock, standby): consumer, results, constants
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
