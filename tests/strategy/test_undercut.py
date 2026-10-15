@@ -18,6 +18,7 @@ from strategy.laps import LapRow
 from strategy.pace import Offset, StintLevel
 from strategy.pitloss import SD_FLOOR, PitLoss
 from strategy.priors import DEFAULT_PRIORS
+from strategy.snapshot import driver_crossing_ms
 from strategy.undercut import (
     DEFAULT_SD_INFLATION,
     AlertTracker,
@@ -26,6 +27,7 @@ from strategy.undercut import (
     UndercutConfig,
     _hard_rules,
     _margin_sd,
+    _others,
     _Side,
     assess_all,
     assess_undercut,
@@ -37,7 +39,7 @@ from strategy.undercut import (
     likely_next_compound,
     normal_cdf,
 )
-from tests.strategy.synthetic import Plan, World, chase_field, clock_at
+from tests.strategy.synthetic import Plan, World, build_race, chase_field, clock_at
 
 TOTAL, N, K = 60, 30, 5
 
@@ -779,3 +781,101 @@ def test_assess_all_assesses_every_car_against_the_one_ahead(ctx):
     first = min(ctx.states.values(), key=lambda s: s.clock_s).driver
     assert by_attacker[first].reasons == ("sem rival à frente",)
     assert by_attacker["A"].rival == "R"
+
+
+# ------------------------------------------------------------------ o estado no instante do
+# atacante
+
+
+def at_attacker(rows, attacker="A", lap=N, **kwargs):
+    """O contexto no instante em que o atacante completa a volta `lap`."""
+    return build_context(
+        rows,
+        upto_lap=lap,
+        total_laps=TOTAL,
+        priors=EXACT,
+        as_of_ms=driver_crossing_ms(rows, attacker, lap),
+        **kwargs,
+    )
+
+
+def test_the_margin_is_the_same_with_only_what_was_known_when_the_attacker_crossed_the_line():
+    """No mundo plano e sem ruído, saber a volta N dos carros de trás não muda a margem do par: com
+    o
+    estado por instante (os de trás ainda na N-1, alinhados pelo modelo) ela é a mesma conta de
+    papel."""
+    rows = chase_field(gap=5.0, world=FLAT)
+    ctx = at_attacker(rows)
+
+    result = assess_undercut(ctx, "A", "R", horizon_k=K)
+
+    assert ctx.as_of_ms == driver_crossing_ms(rows, "A", N)
+    assert ctx.states["A"].laps_done == N and ctx.states["R"].laps_done == N
+    assert ctx.states["D00"].laps_done < N  # o carro lento (lapado) ainda não completou a volta N
+    assert result.margin == pytest.approx(hand_margin(N, K, 5.0), abs=1e-2)
+
+
+def test_the_car_ahead_is_never_one_still_on_the_previous_lap():
+    """A lidera e X vem 3 s atrás. No instante em que A completa a volta N, X ainda está na N-1, e o
+    relógio dele nessa volta é MENOR que o de A na N. Sem olhar a volta, X seria "o carro à frente"
+    do líder."""
+    plans = [Plan("A", base=88.0), Plan("X", base=88.0, grid_gap=3.0)]
+    rows = build_race(plans + [Plan("Z", base=95.0, grid_gap=300.0)], replace(FLAT, noise=0.0))
+    ctx = at_attacker(rows)
+
+    assert ctx.states["X"].laps_done == N - 1
+    assert ctx.states["X"].clock_s < ctx.states["A"].clock_s  # a armadilha
+    assert car_ahead(ctx.states, "A") is None
+    assert car_ahead(ctx.states, "X") is None or ctx.states["X"].laps_done != N  # X atrás de A
+
+
+def test_a_car_on_the_same_lap_and_ahead_is_still_the_car_ahead():
+    ctx = at_attacker(chase_field(gap=5.0, world=FLAT))
+
+    assert car_ahead(ctx.states, "A") == "R"
+
+
+def test_the_cars_still_on_the_previous_lap_are_lined_up_to_lap_n_by_the_model():
+    """O caminho projetado de um carro que está na volta N-1 começa no relógio dele ao fim da N,
+    previsto pelo modelo: com o mundo plano e sem ruído, é o relógio que o gerador dá a ele na N."""
+    rows = chase_field(gap=5.0, world=FLAT)
+    ctx = at_attacker(rows)
+
+    paths = _others(ctx, ctx.pace, {"A", "R"}, horizon=4)
+
+    for driver in ("D00", "D05"):
+        assert ctx.states[driver].laps_done < N  # na volta anterior ou até mais atrás (lapado)
+        assert paths[driver][0] == pytest.approx(clock_at(rows, driver, N), abs=0.1)
+        assert paths[driver][1] == pytest.approx(clock_at(rows, driver, N + 1), abs=0.1)
+
+
+def test_a_car_that_lapped_the_group_does_not_enter_the_projection():
+    ctx = at_attacker(chase_field(gap=5.0, world=FLAT))
+    lapper = replace(ctx.states["D00"], laps_done=ctx.upto_lap + 1)
+    with_lapper = replace(ctx, states={**ctx.states, "D00": lapper})
+
+    assert "D00" not in _others(with_lapper, with_lapper.pace, {"A", "R"}, horizon=3)
+
+
+def test_the_context_at_the_instant_ignores_everything_after_it():
+    rows = chase_field(gap=5.0, world=FLAT)
+    t = driver_crossing_ms(rows, "A", N)
+    spoiled = [
+        replace(r, lap_time_ms=1_000, compound="SOFT", stint=9, pit_in=True, track_status="4")
+        if r.session_time_ms > t
+        else r
+        for r in rows
+    ]
+
+    clean = assess_undercut(at_attacker(rows), "A", "R", horizon_k=K)
+    dirty = assess_undercut(at_attacker(spoiled), "A", "R", horizon_k=K)
+
+    assert dirty == clean
+
+
+def test_the_lap_count_context_is_still_available_and_says_so():
+    rows = chase_field(gap=5.0, world=FLAT)
+
+    ctx = build_context(rows, upto_lap=N, total_laps=TOTAL, priors=EXACT)
+
+    assert ctx.as_of_ms is None and ctx.states["D00"].laps_done == N

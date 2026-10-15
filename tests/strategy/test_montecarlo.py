@@ -42,6 +42,7 @@ from strategy.montecarlo import (
     sensitivity,
     simulate,
 )
+from strategy.snapshot import crossing_ms
 from strategy.undercut import UndercutConfig
 from tests.strategy.synthetic import Plan, World, build_race, chase_field
 
@@ -58,6 +59,7 @@ NO_WEAR = replace(
 )  # com o k físico, como FLAT
 COUNTS = {("MEDIUM", "HARD"): 10, ("SOFT", "MEDIUM"): 4, ("SOFT", "HARD"): 6}
 FREE = UndercutConfig(pass_advantage_s=-1e9, follow_gap_s=0.0)  # ultrapassagem livre
+NO_WEAR_FIELD = replace(FLAT, slopes={"SOFT": 0.0, "MEDIUM": 0.0, "HARD": 0.0})
 
 
 def sim_priors(
@@ -74,6 +76,9 @@ def sim_priors(
 
 
 def prep(rows, lap, priors=None, *, total=TOTAL, **kwargs):
+    """Estado POR CONTAGEM DE VOLTAS (cada piloto na volta N): os testes de mecânica têm relógios
+    exatos nessa volta. O estado por instante tem testes próprios (`test_state_at_the_instant`)."""
+    kwargs.setdefault("snapshot", "volta")
     return prepare(
         rows,
         year=2024,
@@ -362,6 +367,187 @@ def test_a_driver_with_no_clean_lap_at_all_is_left_out_and_reported():
 
 def test_the_state_at_lap_n_ignores_everything_after_n(field_rows, inp):
     assert prep(corrupt_after(field_rows, 30), 30) == inp
+
+
+# ------------------------------------------------------------------ o estado no instante t
+
+
+def instant(rows, lap, priors=None, **kwargs):
+    """O estado PADRÃO: no instante em que o líder completa a volta `lap`."""
+    return prepare(
+        rows,
+        year=2024,
+        round=1,
+        upto_lap=lap,
+        total_laps=TOTAL,
+        sim_priors=priors or sim_priors(),
+        **kwargs,
+    )
+
+
+def test_the_default_state_is_the_one_at_the_instant_the_leader_completes_lap_n(field_rows):
+    state = instant(field_rows, 30)
+    by = {d.driver: d for d in state.drivers}
+
+    assert state.t_ms == crossing_ms(field_rows, 30)
+    assert by["R"].laps_done == 30 and by["A"].laps_done == 29  # A cruza a 30 cinco segundos depois
+    assert all(d.laps_done < 30 for d in state.drivers if d.driver != "R")
+
+
+def test_the_instant_state_ignores_everything_that_happens_after_the_instant(field_rows):
+    t = crossing_ms(field_rows, 30)
+    spoiled = [
+        replace(
+            r,
+            lap_time_ms=1_000,
+            compound="SOFT",
+            tyre_life=99,
+            stint=9,
+            track_status="4",
+            pit_in=True,
+            pit_out=True,
+        )
+        if r.session_time_ms > t
+        else r
+        for r in field_rows
+    ]
+
+    assert instant(spoiled, 30) == instant(field_rows, 30)
+
+
+def test_the_lap_count_state_knows_a_stop_the_instant_state_cannot_know():
+    """A entra nos boxes na volta 30, que ele completa 5 s DEPOIS do líder. Por contagem de voltas o
+    simulador já sabe da parada (e da volta de entrada lenta); no instante em que o líder completa a
+    30,
+    nada disso aconteceu ainda."""
+    rows = chase_field(a_stop=30, gap=5.0, world=FLAT)
+
+    by_laps = {d.driver: d for d in prep(rows, 30).drivers}
+    by_time = {d.driver: d for d in instant(rows, 30).drivers}
+
+    assert by_laps["A"].pit_now and by_laps["A"].laps_done == 30
+    assert not by_time["A"].pit_now and by_time["A"].laps_done == 29
+    assert by_time["A"].clock_s < by_laps["A"].clock_s  # a volta 30 (com os 12 s de box) é futuro
+
+
+def test_a_car_that_left_the_race_is_not_simulated_in_the_instant_state():
+    rows = [r for r in chase_field(world=FLAT) if not (r.driver == "D05" and r.lap_number > 20)]
+
+    state = instant(rows, 40)
+
+    assert "D05" not in {d.driver for d in state.drivers} and "D05" not in state.without_model
+
+
+def test_the_trailing_cars_run_the_lap_they_have_not_completed_and_the_leader_does_not():
+    """R completou a 30; A (0,3 s atrás, mesmo ritmo, sem poder passar) está na 29. A simulação roda
+    a
+    30 só para A e depois todos juntos: R continua à frente e vence. Se o líder andasse de novo a
+    volta
+    que já completou, ficaria uma volta (~90 s) atrás e A venceria."""
+    rows = chase_field(gap=0.3, world=FLAT)
+    inp = deterministic(instant(rows, 30))
+    config = SimConfig(n_sims=400, max_stops=0, sc_rate_multiplier=0.0, retire_rate_multiplier=0.0)
+
+    forecast = simulate(inp, config)
+
+    assert win(forecast, "R") > 0.99 and win(forecast, "A") < 0.01
+
+
+def test_a_safety_car_in_progress_makes_the_lap_the_trailing_cars_still_owe_slow_too():
+    """O SC está em curso quando o líder completa a volta 30 (a volta lenta dele já está no
+    relógio).
+    A volta 30 dos de trás é sob o mesmo SC: se ela fosse verde, o A (5 s atrás, mesmo ritmo) a
+    faria
+    41 s mais rápida e terminaria à frente do líder."""
+    world = replace(FLAT, status_laps={28: "4", 29: "4", 30: "4"}, sc_factor=1.46)
+    inp = deterministic(instant(chase_field(gap=5.0, world=world), 30, sim_priors(0, 20, (), (4,))))
+    config = SimConfig(n_sims=300, max_stops=0, sc_rate_multiplier=0.0, retire_rate_multiplier=0.0)
+
+    forecast = simulate(inp, config)
+
+    assert inp.sc_elapsed == 3 and win(forecast, "R") > 0.99
+
+
+def test_the_leader_does_not_age_its_tyres_while_the_trailing_cars_finish_the_lap_it_has_done():
+    """Pneu que degrada 1 s/volta e dois carros iguais, o A 0,3 s atrás do líder R (sem poder
+    passar).
+    Se o desgaste de R andasse na rodada em que ele não corre, ele ficaria uma volta mais velho, 1 s
+    mais lento por volta, e A o passaria."""
+    steep = replace(NO_WEAR, slopes={"SOFT": 1.0, "MEDIUM": 1.0, "HARD": 1.0}, total_laps=TOTAL)
+    plans = [
+        Plan("R", base=90.0),
+        Plan("A", base=90.0, grid_gap=0.3),
+        Plan("D1", base=100.0, grid_gap=200.0),
+        Plan("D2", base=101.0, grid_gap=260.0),
+    ]
+    inp = deterministic(instant(build_race(plans, steep), 30))
+    config = SimConfig(n_sims=300, max_stops=0, sc_rate_multiplier=0.0, retire_rate_multiplier=0.0)
+
+    forecast = simulate(inp, config)
+
+    assert win(forecast, "R") > 0.99
+
+
+def test_the_leader_that_entered_the_pits_on_lap_n_still_pays_the_out_lap_after_the_instant():
+    """R lidera e entra nos boxes na volta 30 (a volta de entrada, de +12 s, está no relógio). A, 20
+    s
+    atrás, ainda deve a volta 30. Na primeira volta que R anda depois do instante ele paga o resto
+    da
+    perda (~10,5 s) e A passa: A vence. Se a perda pendente de R fosse apagada na rodada em que ele
+    não
+    corre, R sairia à frente e venceria."""
+    inp = deterministic(instant(chase_field(r_stop=30, gap=20.0, world=NO_WEAR_FIELD), 30))
+    config = SimConfig(n_sims=300, max_stops=0, sc_rate_multiplier=0.0, retire_rate_multiplier=0.0)
+    by = {d.driver: d for d in inp.drivers}
+
+    forecast = simulate(inp, config)
+
+    assert by["R"].pit_now and by["R"].laps_done == 30 and by["A"].laps_done == 29
+    assert win(forecast, "A") > 0.99
+
+
+def test_the_instant_state_adds_rounds_for_the_laps_the_trailing_cars_still_owe():
+    """Por contagem de voltas todos estão na 30: rodadas 31 a 60. No instante, os de trás ainda
+    devem a
+    volta 30 (e o mais lapado, mais): há uma rodada a mais para cada volta que falta ao mais
+    atrasado."""
+    rows = chase_field(world=FLAT)
+    state = instant(rows, 30)
+    by_time, by_laps = [], []
+
+    simulate(state, SimConfig(n_sims=100), should_stop=lambda: by_time.append(1) or False)
+    simulate(prep(rows, 30), SimConfig(n_sims=100), should_stop=lambda: by_laps.append(1) or False)
+
+    slowest = min(d.laps_done for d in state.drivers)
+    assert slowest < 29  # o cenário tem carros lapados
+    assert len(by_laps) == TOTAL - 30
+    assert len(by_time) == TOTAL - slowest
+
+
+def test_a_dominant_leader_wins_in_both_states():
+    rows = chase_field(gap=60.0, world=FLAT)
+
+    for state in (instant(rows, 55), prep(rows, 55)):
+        forecast = simulate(state, SimConfig(n_sims=1500))
+
+        assert win(forecast, "R") > 0.99
+
+
+def test_the_variants_still_share_the_same_draws_in_the_instant_state(field_rows):
+    config = SimConfig(n_sims=500)
+    draws = [draw_all(instant(field_rows, 30, variant=v), config) for v in FuelVariant]
+
+    for other in draws[1:]:
+        for f in fields(draws[0]):
+            if f.name != "streams":
+                assert np.array_equal(getattr(draws[0], f.name), getattr(other, f.name)), f.name
+
+
+def test_an_unknown_snapshot_or_a_lap_nobody_completed_is_refused(field_rows):
+    with pytest.raises(ValueError, match="snapshot desconhecido"):
+        instant(field_rows, 30, snapshot="ontem")
+    with pytest.raises(ValueError, match="ninguém completou"):
+        instant(field_rows, 999)
 
 
 # ------------------------------------------------------------------ propriedades da simulação

@@ -132,8 +132,14 @@ def evaluate_race(
     sim_priors: SimPriors,
     config: SimConfig | None = None,
     variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
+    snapshot: str = "tempo",
 ) -> list[LapScore]:
-    """As notas de cada volta de `laps` da corrida, com as constantes dadas (as SEM a corrida)."""
+    """As notas de cada volta de `laps` da corrida, com as constantes dadas (as SEM a corrida).
+
+    `snapshot="tempo"` (o padrão): o estado no instante em que o líder completa a volta. `"volta"`:
+    o
+    estado antigo, por contagem de voltas, que dá aos de trás informação de depois desse
+    instante."""
     order = on_track_order(rows)
     if len(order) < MIN_DRIVERS:
         return []
@@ -150,6 +156,7 @@ def evaluate_race(
             sim_priors=sim_priors,
             priors=priors,
             variant=variant,
+            snapshot=snapshot,
         )
         if len(inp.drivers) < MIN_DRIVERS:
             continue

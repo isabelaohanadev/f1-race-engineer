@@ -17,6 +17,7 @@ from strategy import undercut_eval
 from strategy.fuel import physical_coefficient
 from strategy.population import RaceKind, RaceRef
 from strategy.priors import DEFAULT_PRIORS, RaceStats
+from strategy.snapshot import driver_crossing_ms
 from strategy.undercut import (
     UndercutAssessment,
     UndercutConfig,
@@ -237,21 +238,34 @@ def test_the_live_mode_uses_the_expected_horizon_and_not_the_one_that_happened()
     assert live.realized == oracle.realized  # o resultado real é o mesmo nos dois modos
 
 
-def test_the_assessment_of_an_event_only_uses_the_laps_up_to_n():
-    """Sem vazamento: a avaliação é igual à de uma corrida que PAROU na volta N (o resultado real,
-    do
-    futuro, só serve de gabarito). No modo oráculo o horizonte e os compostos são informação futura
-    por definição, e vêm do evento, não das voltas."""
+def test_the_assessment_of_an_event_only_uses_what_was_known_when_the_attacker_crossed_the_line():
+    """Sem vazamento: a avaliação é igual à de uma corrida que PAROU no instante em que o atacante
+    completou a volta N (o resultado real, do futuro, só serve de gabarito). No modo oráculo o
+    horizonte e os compostos são informação futura por definição, e vêm do evento, não das
+    voltas."""
     rows = real_race()
     (result,), _ = evaluate_race(rows, TOTAL, race="X", priors=EXACT)
-    stopped_at_n = [r for r in rows if r.lap_number <= N]
+    t = driver_crossing_ms(rows, "A", N)
+    stopped_at_t = [r for r in rows if r.session_time_ms <= t]
 
-    ctx = build_context(stopped_at_n, upto_lap=N, total_laps=TOTAL, priors=EXACT)
+    ctx = build_context(stopped_at_t, upto_lap=N, total_laps=TOTAL, priors=EXACT, as_of_ms=t)
     direct = assess_undercut(
         ctx, "A", "R", new_compound="HARD", rival_new_compound="HARD", horizon_k=K
     )
 
     assert result.assessment == direct
+
+
+def test_the_lap_count_snapshot_is_still_available_as_the_leakage_diagnostic():
+    """O estado antigo (cada piloto na volta N dele) existe para medir o quanto ele flatearia o
+    backtest; no mundo plano e sem ruído os dois estados dão a mesma margem do par."""
+    rows = real_race()
+
+    (instant,), _ = evaluate_race(rows, TOTAL, race="X", priors=EXACT, snapshot="tempo")
+    (by_laps,), _ = evaluate_race(rows, TOTAL, race="X", priors=EXACT, snapshot="volta")
+
+    assert instant.assessment.margin == pytest.approx(by_laps.assessment.margin, abs=0.05)
+    assert instant.assessment.margin == pytest.approx(8.4, abs=0.05)
 
 
 def test_a_neutralized_stop_is_evaluated_but_is_not_primary():

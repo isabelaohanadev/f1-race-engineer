@@ -57,6 +57,7 @@ from strategy.laps import LapRow, load_race_laps
 from strategy.population import split_population
 from strategy.priors import DEFAULT_PRIORS, RaceStats, leave_one_out
 from strategy.race_stats import load_race_stats
+from strategy.snapshot import car_states, driver_crossing_ms
 from strategy.tables import render_markdown, render_text
 from strategy.undercut import (
     GREEN,
@@ -66,7 +67,6 @@ from strategy.undercut import (
     assess_undercut,
     build_context,
     car_ahead,
-    car_states,
     normal_cdf,
 )
 
@@ -263,27 +263,36 @@ def evaluate_race(
     config: UndercutConfig | None = None,
     variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
     oracle: bool = True,
+    snapshot: str = "tempo",
 ) -> tuple[list[EventResult], Counter[str]]:
-    """Avalia cada evento da corrida. `priors` deve ser o `leave_one_out` dela (nunca o padrão)."""
+    """Avalia cada evento da corrida. `priors` deve ser o `leave_one_out` dela (nunca o padrão).
+
+    `snapshot="tempo"` (o padrão): o modelo vê só o que se sabia no INSTANTE em que o atacante
+    completa
+    a volta N (`strategy.snapshot`). `"volta"` é o estado antigo, por contagem de voltas, que dá aos
+    de
+    trás informação de depois desse instante (diagnóstico do vazamento)."""
     cfg = config or UndercutConfig()
     events, skipped = find_events(rows, total_laps, race=race, config=cfg)
-    contexts: dict[int, LapContext] = {}  # um ajuste por volta N, dividido entre os eventos dela
+    contexts: dict[tuple[int, int | None], LapContext] = {}  # um ajuste por (volta, instante)
     results: list[EventResult] = []
     for event in events:
         realized = realized_margin(rows, event)
         if realized is None:
             skipped["sem relógio no fim"] += 1
             continue
-        if event.lap not in contexts:
-            contexts[event.lap] = build_context(
+        as_of = driver_crossing_ms(rows, event.attacker, event.lap) if snapshot == "tempo" else None
+        if (event.lap, as_of) not in contexts:
+            contexts[(event.lap, as_of)] = build_context(
                 rows,
                 upto_lap=event.lap,
                 total_laps=total_laps,
                 variant=variant,
                 priors=priors,
                 config=cfg,
+                as_of_ms=as_of,
             )
-        ctx = contexts[event.lap]
+        ctx = contexts[(event.lap, as_of)]
         kwargs = (
             {
                 "new_compound": event.new_compound_a,

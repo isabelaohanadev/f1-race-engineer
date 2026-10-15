@@ -70,6 +70,7 @@ from strategy.laps import DRY_COMPOUNDS, LapRow
 from strategy.pace import DEFAULT_SIGMA, Offset, PaceModel, StintLevel, fit_pace
 from strategy.pitloss import PitLoss, estimate_pit_loss
 from strategy.priors import DEFAULT_PRIORS, Priors
+from strategy.snapshot import MAX_SILENCE_LAPS, CarState, car_states, state_until
 
 # PROVISÓRIO. O fator que faria o intervalo da INCLINAÇÃO de um stint futuro cobrir 95% (o quantil
 # 95% de |z| nos 251 stints, com o `k` do modelo, dá 1,29). Vem da calibração da inclinação, não da
@@ -105,42 +106,14 @@ class UndercutConfig:
 # ---------------------------------------------------------------- o estado da corrida na volta N
 
 
-@dataclass(frozen=True, slots=True)
-class CarState:
-    driver: str
-    clock_s: float  # relógio da sessão ao fim da volta N (o mesmo para todos os pilotos)
-    compound: str | None
-    age: int | None
-    stint: int | None
-    status: str | None
-    pit_in: bool
-    pit_out: bool
-
-
-def car_states(rows: Sequence[LapRow], upto_lap: int) -> dict[str, CarState]:
-    """Cada piloto que completou a volta `upto_lap` e o seu estado nela."""
-    return {
-        lap.driver: CarState(
-            lap.driver,
-            lap.session_time_ms / 1000,
-            lap.compound,
-            lap.tyre_life,
-            lap.stint,
-            lap.track_status,
-            bool(lap.pit_in),
-            bool(lap.pit_out),
-        )
-        for lap in rows
-        if lap.lap_number == upto_lap and lap.session_time_ms is not None
-    }
-
-
 def car_ahead(states: dict[str, CarState], driver: str) -> str | None:
-    """O carro imediatamente à frente: o de maior relógio entre os de relógio menor que o dele."""
+    """O carro imediatamente à frente: o de maior relógio entre os de relógio menor que o dele, na
+    MESMA volta (no estado por instante, um carro uma volta atrás tem relógio menor e não está à
+    frente; um que o lapou também não é "o carro à frente" numa disputa)."""
     me = states.get(driver)
     if me is None:
         return None
-    ahead = [s for s in states.values() if s.clock_s < me.clock_s]
+    ahead = [s for s in states.values() if s.laps_done == me.laps_done and s.clock_s < me.clock_s]
     return max(ahead, key=lambda s: s.clock_s).driver if ahead else None
 
 
@@ -216,6 +189,7 @@ class LapContext:
     pit_loss: PitLoss | None
     states: dict[str, CarState]
     flat: dict[str, float]
+    as_of_ms: int | None = None  # o instante do estado (None = por contagem de voltas)
 
     @property
     def laps_left(self) -> int:
@@ -230,8 +204,21 @@ def build_context(
     variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
     priors: Priors = DEFAULT_PRIORS,
     config: UndercutConfig | None = None,
+    as_of_ms: int | None = None,
+    max_silence_laps: float = MAX_SILENCE_LAPS,
 ) -> LapContext:
-    visible = laps_until(rows, upto_lap)  # PRIMEIRO passo: nada do futuro passa daqui
+    """O contexto da volta `upto_lap`. Com `as_of_ms` o estado é o do INSTANTE (só as voltas
+    completadas até ele, cada piloto na sua última volta: o que um sistema ao vivo saberia); sem
+    ele,
+    é o estado por contagem de voltas (cada piloto na volta N dele), que dá ao retardatário
+    informação de depois do instante e fica para os testes de mecânica e o diagnóstico."""
+    if as_of_ms is None:
+        visible = laps_until(rows, upto_lap)  # PRIMEIRO passo: nada do futuro passa daqui
+        states = car_states(visible, upto_lap)
+    else:
+        snapshot = state_until(rows, as_of_ms, max_silence_laps=max_silence_laps)
+        visible = [r for r in snapshot.rows if r.lap_number <= upto_lap]
+        states = snapshot.cars
     pace = fit_pace(
         visible, upto_lap=upto_lap, total_laps=total_laps, variant=variant, priors=priors
     )
@@ -262,8 +249,9 @@ def build_context(
         pit_loss=estimate_pit_loss(
             visible, upto_lap=upto_lap, kappa=pace.kappa, prior=priors.pit_loss
         ),
-        states=car_states(visible, upto_lap),
+        states=states,
         flat=flat_pace(visible, upto_lap),
+        as_of_ms=as_of_ms,
     )
 
 
@@ -373,23 +361,27 @@ class _Projection:
 def _others(
     ctx: LapContext, pace: PaceModel, skip: set[str], horizon: int
 ) -> dict[str, np.ndarray]:
-    """O relógio projetado (voltas 0..H) dos OUTROS carros, supondo que ficam fora no pneu atual."""
+    """O relógio projetado (voltas 0..H) dos OUTROS carros, supondo que ficam fora no pneu atual. O
+    índice 0 é o relógio ao fim da volta N; um carro que ainda está na volta anterior (estado por
+    instante) primeiro anda as `lag` voltas que lhe faltam, pelo modelo, para chegar à N."""
     out = {}
     n = ctx.upto_lap
-    steps = np.arange(1, horizon + 1)
     for driver, state in ctx.states.items():
-        if driver in skip:
-            continue
+        if driver in skip or state.laps_done > n:
+            continue  # quem já lapou o grupo não disputa posição com ele
+        lag = n - state.laps_done
+        steps = np.arange(1, lag + horizon + 1)
         cur = pace.current(driver)
         if cur is not None and state.stint == cur.stint and state.age is not None:
-            times = (
-                cur.level0 + cur.slope.slope * (state.age + steps) - pace.kappa * (n + steps - 1)
-            )
+            laps = state.laps_done + steps
+            times = cur.level0 + cur.slope.slope * (state.age + steps) - pace.kappa * (laps - 1)
         elif driver in ctx.flat:
-            times = np.full(horizon, ctx.flat[driver])
+            times = np.full(lag + horizon, ctx.flat[driver])
         else:
             continue
-        out[driver] = np.concatenate([[state.clock_s], state.clock_s + np.cumsum(times)])
+        cumulative = state.clock_s + np.cumsum(times)
+        start = cumulative[lag - 1] if lag > 0 else state.clock_s
+        out[driver] = np.concatenate([[start], cumulative[lag:]])
     return out
 
 

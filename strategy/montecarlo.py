@@ -61,7 +61,13 @@ from strategy.laps import DRY_COMPOUNDS, LapRow
 from strategy.pace import DEFAULT_SIGMA, PaceModel, fit_pace
 from strategy.pitloss import PitLoss, estimate_pit_loss
 from strategy.priors import DEFAULT_PRIORS, Priors
-from strategy.undercut import CarState, UndercutConfig, car_states, flat_pace
+from strategy.snapshot import (
+    MAX_SILENCE_LAPS,
+    CarState,
+    car_states,
+    state_at_leader_lap,
+)
+from strategy.undercut import UndercutConfig, flat_pace
 
 COMPOUNDS = ("SOFT", "MEDIUM", "HARD")
 STREAMS = ("params", "pit", "compound", "sc", "retirement", "lap_noise")
@@ -100,9 +106,10 @@ class DriverSpec:
     """Um piloto como o simulador o vê na volta N: onde está e o que o modelo diz dele."""
 
     driver: str
-    clock_s: float
+    clock_s: float  # ao fim da última volta completa dele
+    laps_done: int  # essa volta (no estado por instante, varia entre os pilotos)
     compound: int  # índice em COMPOUNDS
-    age: int  # idade do pneu na volta N
+    age: int  # idade do pneu nessa volta
     used: tuple[bool, bool, bool]  # compostos de seco já usados
     pit_now: bool  # entrou nos boxes na volta N: troca de pneu no começo da N+1
     inlap_excess: float  # o quanto a volta de entrada passou do ritmo: já está no relógio
@@ -135,6 +142,7 @@ class SimInput:
     sc_elapsed: int  # voltas que o SC em curso já durou (0 = pista livre na volta N)
     without_model: tuple[str, ...]  # pilotos na pista sem nenhum ritmo: ficam de fora
     variant: FuelVariant
+    t_ms: int | None = None  # o instante do estado (None = por contagem de voltas)
 
     @property
     def laps_left(self) -> int:
@@ -234,7 +242,7 @@ def _flat_spec(
     est = pace.degradation.slope(driver, COMPOUNDS[cidx])
     slope = est.slope if est is not None else DEFAULT_SLOPE
     slope_sd = est.predictive_sd if est is not None else 0.03
-    level = flat[driver] + pace.kappa * (upto_lap - 1) - slope * age
+    level = flat[driver] + pace.kappa * (state.laps_done - 1) - slope * age
     level_se = max(sigma / math.sqrt(3), MIN_FLAT_SE)  # três voltas de referência
     return _finish_spec(
         driver,
@@ -276,6 +284,7 @@ def _finish_spec(
     return DriverSpec(
         driver=driver,
         clock_s=state.clock_s,
+        laps_done=state.laps_done,
         compound=cidx,
         age=age,
         used=tuple(name in used for name in COMPOUNDS),  # type: ignore[arg-type]
@@ -304,13 +313,32 @@ def prepare(
     sim_priors: SimPriors,
     priors: Priors = DEFAULT_PRIORS,
     variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
+    snapshot: str = "tempo",
+    max_silence_laps: float = MAX_SILENCE_LAPS,
 ) -> SimInput:
-    """O estado da corrida na volta N e o modelo de cada piloto, só com o que se sabia nela."""
-    visible = laps_until(rows, upto_lap)  # PRIMEIRO passo: nada do futuro passa daqui
+    """O estado da corrida na volta N e o modelo de cada piloto, só com o que se sabia.
+
+    `snapshot="tempo"` (o padrão) é o estado NO INSTANTE em que o líder completa a volta N
+    (`strategy.snapshot.state_until`): cada piloto na sua última volta completa, sem nada do que
+    acontece depois. `snapshot="volta"` é o desenho antigo, cada piloto na volta N dele, que dá ao
+    retardatário informação de depois desse instante: fica para os testes de mecânica e para medir o
+    quanto ele flatearia o backtest."""
+    t_ms: int | None = None
+    if snapshot == "tempo":
+        state = state_at_leader_lap(rows, upto_lap, max_silence_laps=max_silence_laps)
+        if state is None:
+            raise ValueError(f"ninguém completou a volta {upto_lap}")
+        visible = list(state.rows)  # PRIMEIRO passo: nada do futuro passa daqui
+        states = state.cars
+        t_ms = state.t_ms
+    elif snapshot == "volta":
+        visible = laps_until(rows, upto_lap)
+        states = car_states(visible, upto_lap)
+    else:
+        raise ValueError(f"snapshot desconhecido: {snapshot!r}")
     pace = fit_pace(
         visible, upto_lap=upto_lap, total_laps=total_laps, variant=variant, priors=priors
     )
-    states = car_states(visible, upto_lap)
     flat = flat_pace(visible, upto_lap)
     used = _used_compounds(visible)
     loss = estimate_pit_loss(visible, upto_lap=upto_lap, kappa=pace.kappa, prior=priors.pit_loss)
@@ -318,9 +346,7 @@ def prepare(
         loss = PitLoss(priors.pit_loss.mean, priors.pit_loss.stop_sd, priors.pit_loss.between_sd,
                        None, 0, 0, None, 0.0, "prior")  # fmt: skip
     lap_times = {
-        r.driver: r.lap_time_ms / 1000
-        for r in visible
-        if r.lap_number == upto_lap and r.lap_time_ms is not None
+        (r.driver, r.lap_number): r.lap_time_ms / 1000 for r in visible if r.lap_time_ms is not None
     }
     specs: list[DriverSpec] = []
     missing: list[str] = []
@@ -329,15 +355,16 @@ def prepare(
         if spec is None:
             missing.append(driver)
             continue
-        if spec.pit_now and driver in lap_times:
+        if spec.pit_now and (driver, spec.laps_done) in lap_times:
             # a volta de entrada já está no relógio com a parte da perda que cabe a ela (o excesso
             # sobre o ritmo): na volta de saída só falta o resto, senão a perda conta duas vezes
             normal = (
                 spec.levels[spec.compound]
                 + spec.slopes[spec.compound] * spec.age
-                - pace.kappa * (upto_lap - 1)
+                - pace.kappa * (spec.laps_done - 1)
             )
-            spec = replace(spec, inlap_excess=max(lap_times[driver] - normal, 0.0))
+            excess = max(lap_times[(driver, spec.laps_done)] - normal, 0.0)
+            spec = replace(spec, inlap_excess=excess)
         specs.append(spec)
     return SimInput(
         year=year,
@@ -351,6 +378,7 @@ def prepare(
         sc_elapsed=_sc_elapsed(visible, upto_lap),
         without_model=tuple(missing),
         variant=variant,
+        t_ms=t_ms,
     )
 
 
@@ -691,6 +719,7 @@ def simulate(
     shared_sd = np.array([d.offset_shared_sd for d in spec])
     tau = np.array([d.offset_tau for d in spec])
     sigma = np.array([d.sigma for d in spec])
+    laps_done = np.array([d.laps_done for d in spec])
     level0_err = draws.level_err * level_se - mean_age * draws.slope_err * slope_sd  # (S, n)
     cur_slope_err = draws.slope_err * slope_sd
     shared = draws.offset_shared[:, cur0, :] * shared_sd[None]  # (S, n, 3): do composto atual a k
@@ -772,14 +801,19 @@ def simulate(
     rows_ix = np.arange(s)[:, None]
     noise = draws.streams["lap_noise"]
 
-    for j in range(1, laps + 1):
-        lap_no = inp.upto_lap + j
+    # Rodadas por NÚMERO DE VOLTA. No estado por instante os carros começam em voltas diferentes (o
+    # líder na N, os outros na N-1 ou antes); cada um só simula as voltas que ainda não completou, e
+    # depois da volta N todos andam juntos. Quem já tem a volta da rodada (o líder, na N) não anda.
+    for lap_no in range(int(laps_done.min()) + 1, inp.total_laps + 1):
         if should_stop is not None and should_stop():
             raise SimulationCancelled
         z = noise.standard_normal((s, n))  # sempre (S, n): o consumo não depende de quem vive
-        alive = retire_lap >= lap_no  # completa esta volta
-        under_sc = sc_mask[:, j - 1]
-        age_now = age + np.where(under_sc, config.sc_wear, 1.0)[:, None]
+        alive = (laps_done[None, :] < lap_no) & (retire_lap >= lap_no)  # anda esta volta
+        if lap_no > inp.upto_lap:
+            under_sc = sc_mask[:, lap_no - inp.upto_lap - 1]
+        else:  # a volta que falta aos de trás, com o SC que já estava em curso para o líder
+            under_sc = np.full(s, inp.sc_elapsed > 0)
+        age_now = np.where(alive, age + np.where(under_sc, config.sc_wear, 1.0)[:, None], age)
         l_cur, s_cur = _take(lv, cur), _take(sl, cur)
         base_lap = l_cur + s_cur * age_now - inp.kappa * (lap_no - 1) + z * sigma
 
@@ -800,8 +834,8 @@ def simulate(
         forced = ~two & (left <= config.force_laps_left)
         can = alive & (stops_done < stops_cap) & (left >= 1) & (pending == 0)
         pit = can & (wants | forced)
-        penalty = np.where(pit, eff_loss, 0.0) + pending  # a troca custa na volta em que acontece
-        pending = np.zeros((s, n))
+        penalty = np.where(pit, eff_loss, 0.0) + pending  # a troca custa (só conta em quem anda)
+        pending = np.where(alive, 0.0, pending)  # na volta em que acontece
 
         # ---- o relógio. Quem abandona nesta volta já fica no fim da fila (relógio infinito).
         prev = np.where(alive, clock, np.inf)
