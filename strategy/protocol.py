@@ -50,6 +50,7 @@ class Protocol:
     # ---- o erro do tempo de volta
     horizons: tuple[int, ...] = (1, 2, 3, 4, 5)  # voltas à frente
     interval_coverage: float = 0.90
+    persistence_baseline_laps: int = 3  # o comparador de persistência do tempo de volta
     # ---- o estado no instante t
     max_silence_laps: float = 2.0  # sem cruzar a linha por tantas voltas típicas = fora da corrida
     # ---- a estatística

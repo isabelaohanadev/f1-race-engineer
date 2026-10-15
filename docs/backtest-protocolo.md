@@ -100,6 +100,20 @@ resultados do backtest.
 - **VSC (8 períodos) e bandeira vermelha (2)** ficam fora do simulador, e abandono não causa SC.
 - Vinte e uma corridas é uma amostra pequena: os intervalos de bootstrap serão largos.
 
+## Adendo (antes de rodar o backtest): o comparador do tempo de volta
+
+Escrito depois do congelamento acima e **antes de qualquer execução na população**. O erro de previsão do
+tempo de volta ganha um comparador, para o número ter o que bater: a **persistência**, a mediana das **3
+últimas voltas limpas** do próprio piloto, sem modelo nenhum. "Volta limpa" é: pista verde (status
+exatamente `"1"`), sem entrada nem saída dos boxes, depois da volta 1, de pneu de seco e **no mesmo stint**
+em que o piloto estava no instante t. O horizonte `h` é contado a partir da **última volta completa de cada
+piloto** (o líder na N, os de trás na N-1 ou antes). O intervalo de 90% usa o desvio do modelo (nível,
+inclinação e ruído de volta), sem inflação.
+
+Também fica fixado que o estado do **undercut** é o do instante em que o **atacante** completa a volta N, e
+o do **Monte Carlo** e do erro de tempo de volta, o do instante em que o **líder** a completa; e que o
+estado antigo (cada piloto na volta N dele) só aparece como **diagnóstico do vazamento**.
+
 ## Ajustes pós-resultado
 
 Nenhum até agora (este documento precede o resultado). Se houver, ficam registrados em `docs/backtest.md`.

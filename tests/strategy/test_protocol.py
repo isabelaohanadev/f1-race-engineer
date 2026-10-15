@@ -36,6 +36,7 @@ def test_the_values_the_documents_quote_are_the_frozen_ones():
     assert (FROZEN.first_lap, FROZEN.every) == (5, 5)
     assert FROZEN.variants == ("fisico", "estimado", "encolhimento")
     assert FROZEN.headline_variant == "encolhimento"
+    assert FROZEN.persistence_baseline_laps == 3 and FROZEN.max_silence_laps == 2.0
 
 
 def test_the_protocol_is_immutable():
@@ -61,3 +62,13 @@ def test_a_modified_protocol_builds_a_different_config():
     assert frozen_undercut_config(changed).threshold == 0.7
     assert frozen_undercut_config(changed).sd_inflation == 1.5
     assert frozen_sim_config(changed).traffic.threshold == 0.7
+
+
+def test_the_state_constants_of_the_modules_are_the_frozen_ones():
+    """O silêncio máximo e as voltas de referência da persistência vivem nos módulos e no
+    protocolo."""
+    from strategy.laptime_eval import BASELINE_LAPS
+    from strategy.snapshot import MAX_SILENCE_LAPS
+
+    assert FROZEN.max_silence_laps == MAX_SILENCE_LAPS
+    assert FROZEN.persistence_baseline_laps == BASELINE_LAPS
