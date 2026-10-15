@@ -596,3 +596,22 @@ def test_the_payload_has_exactly_the_fields_the_api_documents_and_validates(race
     assert set(p["alerts"][0]) == set(UndercutAlertOut.model_fields)
     assert set(p["warnings"][0]) == set(StrategyWarningOut.model_fields)
     assert set(p["inputs"]) == set(StrategyInputsOut.model_fields)
+
+
+def test_the_consumer_assessments_are_the_ones_of_the_shared_leader_lap_function(entries):
+    """`strategy.undercut_live` avalia a forma ao vivo com `leader_lap_assessments`; o consumidor
+    entrega exatamente o que ela devolve (se um dia divergirem, a avaliação deixa de valer)."""
+    from strategy.live import leader_lap_assessments
+
+    _, triggers = feed(entries, lap_limit=30)
+    c = result_for(next(x for x in triggers if x.lap == 30))
+
+    _, shared = leader_lap_assessments(
+        c.trigger.rows,
+        lap=30,
+        total_laps=TOTAL,
+        t_ms=c.sim_input.t_ms,
+        priors=CONSTANTS.priors,
+    )
+
+    assert c.assessments == shared

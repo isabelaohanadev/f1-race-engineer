@@ -27,6 +27,7 @@ voltas entram ordenadas por (piloto, volta), como `load_race_laps` as devolve, e
 numericamente o do backtest (`tests/strategy/test_live.py` compara os dois).
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -48,7 +49,13 @@ from strategy.payload import track_warnings
 from strategy.priors import Priors
 from strategy.protocol import FROZEN, frozen_sim_config, frozen_undercut_config
 from strategy.snapshot import crossing_ms
-from strategy.undercut import UndercutAssessment, UndercutConfig, assess_all, build_context
+from strategy.undercut import (
+    LapContext,
+    UndercutAssessment,
+    UndercutConfig,
+    assess_all,
+    build_context,
+)
 
 FIRST_LAP = FROZEN.first_lap  # o backtest começa na volta 5: antes não há dados para o modelo
 DEFAULT_WAIT_S = 0.3
@@ -255,6 +262,32 @@ class Computation:
     warnings: list[dict[str, str]]
 
 
+def leader_lap_assessments(
+    rows: Sequence[LapRow],
+    *,
+    lap: int,
+    total_laps: int,
+    t_ms: int,
+    priors: Priors,
+    config: UndercutConfig | None = None,
+    variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
+) -> tuple[LapContext, list[UndercutAssessment]]:
+    """Os alertas de undercut de TODOS os pilotos no instante em que o líder completa a volta `lap`:
+    um contexto só (`build_context(as_of_ms=)`) e cada piloto contra o carro à frente dele no estado
+    daquele instante. É o que o consumidor entrega, e o que `strategy.undercut_live` avalia: uma
+    função só, para a avaliação nunca divergir do que roda ao vivo."""
+    context = build_context(
+        rows,
+        upto_lap=lap,
+        total_laps=total_laps,
+        variant=variant,
+        priors=priors,
+        config=config or frozen_undercut_config(),
+        as_of_ms=t_ms,
+    )
+    return context, assess_all(context)
+
+
 def compute(
     trigger: Trigger,
     constants: Constants,
@@ -284,14 +317,14 @@ def compute(
     forecast = simulate(inp, sim_config or frozen_sim_config(), should_stop=should_stop)
     if should_stop():
         raise SimulationCancelled
-    context = build_context(
+    _, assessments = leader_lap_assessments(
         trigger.rows,
-        upto_lap=trigger.lap,
+        lap=trigger.lap,
         total_laps=trigger.total_laps,
-        variant=variant,
+        t_ms=inp.t_ms,  # type: ignore[arg-type]
         priors=constants.priors,
-        config=undercut_config or frozen_undercut_config(),
-        as_of_ms=inp.t_ms,
+        config=undercut_config,
+        variant=variant,
     )
     visible = [
         r for r in trigger.rows if r.session_time_ms is not None and r.session_time_ms <= inp.t_ms
@@ -300,7 +333,7 @@ def compute(
         trigger,
         forecast,
         inp,
-        assess_all(context),
+        assessments,
         current_leader(visible, trigger.lap),
         track_warnings(visible, trigger.lap, inp.sc_elapsed),
     )
