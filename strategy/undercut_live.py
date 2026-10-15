@@ -54,6 +54,7 @@ import numpy as np
 from db.session import get_session_factory
 from strategy.backtest import LIVE, TEMPO, RaceBundle, RaceOutcome, load_bundles, load_outcomes
 from strategy.backtest_report import git_head, wilson
+from strategy.forecast_eval import Interval, paired_bootstrap, verdict
 from strategy.fuel import FuelVariant
 from strategy.laps import LapRow
 from strategy.live import FIRST_LAP, leader_lap_assessments
@@ -379,10 +380,11 @@ def reliability_rows(results: Sequence[EventResult], threshold: float) -> list[l
     return rows
 
 
-def section_comparison(
-    by_race: Sequence[RaceLive], old: dict[tuple[str, str, int], EventResult], threshold: float
-) -> str:
-    """Nos MESMOS eventos (primários nas duas formas): forma antiga contra forma ao vivo."""
+def common_pairs(
+    by_race: Sequence[RaceLive], old: dict[tuple[str, str, int], EventResult]
+) -> list[tuple[EventResult, EventResult]]:
+    """(forma antiga, forma ao vivo) dos eventos que são primários nas DUAS: a mesma parada, o mesmo
+    rival e o mesmo resultado real."""
     pairs = []
     for race in by_race:
         for e in race.events[PRIMARY]:
@@ -391,6 +393,41 @@ def section_comparison(
             o = old.get((e.event.race, e.event.attacker, e.event.lap))
             if o is not None and o.primary:
                 pairs.append((o, e.result))
+    return pairs
+
+
+def brier_difference(pairs: Sequence[tuple[EventResult, EventResult]]) -> Interval | None:
+    """O Brier da forma ao vivo menos o da antiga, nos mesmos eventos, com o intervalo de 95% por
+    bootstrap sobre as CORRIDAS (os eventos da mesma corrida não são independentes). Negativo = a
+    forma ao vivo erra menos."""
+    live: dict[str, list[float]] = {}
+    antiga: dict[str, list[float]] = {}
+    for o, n in pairs:
+        po, pn = o.probability(), n.probability()
+        if po is None or pn is None:
+            continue
+        antiga.setdefault(o.event.race, []).append((po - o.success) ** 2)
+        live.setdefault(o.event.race, []).append((pn - n.success) ** 2)
+    return paired_bootstrap(
+        {race: float(np.mean(v)) for race, v in live.items()},
+        {race: float(np.mean(v)) for race, v in antiga.items()},
+    )
+
+
+def _interval(interval: Interval | None) -> str:
+    if interval is None:
+        return "sem dados"
+    return (
+        f"{interval.mean:+.3f} [{interval.low:+.3f}, {interval.high:+.3f}] "
+        f"({interval.n_races} corridas)"
+    )
+
+
+def section_comparison(
+    by_race: Sequence[RaceLive], old: dict[tuple[str, str, int], EventResult], threshold: float
+) -> str:
+    """Nos MESMOS eventos (primários nas duas formas): forma antiga contra forma ao vivo."""
+    pairs = common_pairs(by_race, old)
     if not pairs:
         return "Nenhum evento primário nas duas formas: sem comparação."
     olds, lives = [p[0] for p in pairs], [p[1] for p in pairs]
@@ -400,6 +437,7 @@ def section_comparison(
     only_old = sum(1 for a, b in zip(po, pl, strict=True) if a >= threshold > b)
     only_live = sum(1 for a, b in zip(po, pl, strict=True) if b >= threshold > a)
     gap = float(np.mean([abs(a - b) for a, b in zip(po, pl, strict=True)]))
+    difference = brier_difference(pairs)
     table = [
         ["forma", "eventos", "Brier", "alertas no limiar: acertos (Wilson)"],
         [
@@ -420,9 +458,22 @@ def section_comparison(
         "rival, o mesmo resultado real):\n\n"
         f"{render_markdown(table)}\n\n"
         f"Alertas no limiar: nas duas formas **{both}**, só na antiga **{only_old}**, só na ao "
-        f"vivo "
-        f"**{only_live}**. Diferença absoluta média entre as duas probabilidades: {gap:.3f}."
+        f"vivo **{only_live}**. Diferença absoluta média entre as duas probabilidades: "
+        f"{gap:.3f}.\n\n"
+        f"Brier da forma ao vivo menos o da antiga, com bootstrap sobre as corridas: "
+        f"**{_interval(difference)}**. Pela regra do backtest: **{_verdict(difference)}**."
     )
+
+
+def _verdict(difference: Interval | None) -> str:
+    """`forecast_eval.verdict` lê "supera / é pior / não supera"; aqui a pergunta é se a forma ao
+    vivo erra menos que a antiga."""
+    return {
+        "supera": "a forma ao vivo erra menos que a antiga",
+        "é pior": "a forma ao vivo erra mais que a antiga",
+        "não supera": "não se distingue da antiga nesta amostra",
+        "sem dados": "sem dados",
+    }[verdict(difference)]
 
 
 def section_hysteresis(by_race: Sequence[RaceLive], threshold: float) -> str:
@@ -467,6 +518,40 @@ def section_per_race(by_race: Sequence[RaceLive], threshold: float) -> str:
     return render_markdown(rows)
 
 
+def section_summary(
+    by_race: Sequence[RaceLive], old: dict[tuple[str, str, int], EventResult], threshold: float
+) -> str:
+    """O resumo, gerado dos mesmos números das seções (a redação não pode divergir deles)."""
+    primary = [e for race in by_race for e in race.events[PRIMARY]]
+    main = primary_results(primary)
+    summary = summarize(main, threshold=threshold)
+    probs, wins = scored(main, threshold)
+    why = Counter(e.reason for e in primary if e.reason)
+    lines = [
+        f"- **{len(main)} de {len(primary)} eventos** viraram uma decisão ao vivo no par do "
+        "evento; "
+        + ", ".join(f'{n} ficaram fora por "{reason}"' for reason, n in why.most_common())
+        + ". **Nenhum undercut contra o líder é avaliado nem alertado ao vivo.**",
+        f"- Dos **{summary.n_primary}** eventos primários, os alertas no limiar acertaram "
+        f"{_precision(probs, wins, threshold)}; Brier {_f(summary.brier, 3)} contra "
+        f"{_f(summary.brier_baseline, 3)} "
+        "de quem prevê sempre a taxa-base. **A precisão é otimista** (só as paradas que "
+        "aconteceram) e a amostra é pequena.",
+        f"- A margem: viés de {_f(summary.margin_bias)} s, erro absoluto de "
+        f"{_f(summary.margin_mae)} s e o intervalo de 90% cobre {_f(summary.coverage_90)} (o "
+        f"congelado é 1,3; os dados "
+        f"pedem {_f(calibrate_inflation(main).raw_factor)}: **não aplicado**).",
+    ]
+    pairs = common_pairs(by_race, old)
+    if pairs:
+        difference = brier_difference(pairs)
+        lines.append(
+            f"- **Contra a forma antiga, nos mesmos {len(pairs)} eventos:** Brier da ao vivo "
+            f"menos o da antiga {_interval(difference)}: {_verdict(difference)}."
+        )
+    return "\n".join(lines)
+
+
 CAVEATS = """\
 - **Só paradas que aconteceram, e as equipes tendem a parar quando funciona.** A taxa de sucesso
   daqui é mais alta que a de uma situação qualquer de atacante atrás de rival: a **precisão é
@@ -492,6 +577,7 @@ def build_report(
     *,
     threshold: float | None = None,
     adjustments: Sequence[str] = (),
+    notes: Sequence[str] = (),
     generated_on: date | None = None,
 ) -> str:
     threshold = FROZEN.alert_threshold if threshold is None else threshold
@@ -525,6 +611,8 @@ def build_report(
         "aparece com a volta anterior; (2) o líder nunca é o carro à frente de ninguém "
         "(`car_ahead` só compara carros na mesma volta, e no instante em que o líder completa a "
         "volta N os outros estão na N-1).\n\n"
+        "## Resumo\n\n"
+        f"{section_summary(by_race, old, threshold)}\n\n"
         "## Como cada parada real virou uma decisão ao vivo\n\n"
         f"{section_mapping(by_race)}\n\n"
         "## Resultado\n\n"
@@ -545,6 +633,12 @@ def build_report(
         f"{CAVEATS}\n"
         "## Ajustes pós-resultado\n\n"
         f"{adjusted}\n"
+        + (
+            "\n**Análises e acréscimos feitos depois do resultado, que NÃO alteram o protocolo nem "
+            "o que foi medido:**\n\n" + "\n".join(f"- {n}" for n in notes) + "\n"
+            if notes
+            else ""
+        )
     )
 
 
@@ -574,6 +668,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--markdown", type=Path, default=None, help="grava o relatório (.md)")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--adjustment", action="append", default=[], help="um ajuste pós-resultado")
+    parser.add_argument(
+        "--note",
+        action="append",
+        default=[],
+        help="análise ou acréscimo feito depois do resultado, sem alterar o protocolo (repetível)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING)
 
@@ -591,7 +691,10 @@ def main(argv: list[str] | None = None) -> int:
             with args.cache.open("wb") as handle:
                 pickle.dump(by_race, handle)
     report = build_report(
-        by_race, old_form(load_outcomes(args.backtest_cache)), adjustments=tuple(args.adjustment)
+        by_race,
+        old_form(load_outcomes(args.backtest_cache)),
+        adjustments=tuple(args.adjustment),
+        notes=tuple(args.note),
     )
     print(report)
     if args.markdown is not None:

@@ -325,3 +325,80 @@ def test_the_event_says_whether_the_tracker_had_the_pair_switched_on_at_that_res
 
     assert mapped(rows, on, crossings, event).tracker_alert is True
     assert mapped(rows, off, crossings, event).tracker_alert is False
+
+
+# ================================================================ a comparação com a forma antiga
+
+
+def pair_with(race: str, old_p: float, live_p: float, realized: float, base):
+    """(antiga, ao vivo) de um evento com as probabilidades dadas e o resultado real dado."""
+    from strategy.undercut_eval import EventResult
+
+    event = replace(base.event, race=race)
+
+    def with_probability(p: float):
+        # desvio 0: `EventResult.probability()` devolve a do `assessment`, sem refazer a conta
+        assessment = replace(base.assessment, probability=p, margin_sd=0.0)
+        return EventResult(event, assessment, realized, False, 1.3)
+
+    return with_probability(old_p), with_probability(live_p)
+
+
+@pytest.fixture(scope="module")
+def base_result(race_live):
+    return next(e.result for e in race_live.events[PRIMARY] if e.result is not None)
+
+
+def test_the_brier_difference_is_negative_when_the_live_form_errs_less(base_result):
+    from strategy.undercut_live import brier_difference
+
+    # deu certo (realized > 0): a ao vivo diz 0,9 e a antiga 0,6, em 5 corridas
+    pairs = [pair_with(f"R{i}", 0.6, 0.9, 3.0, base_result) for i in range(5)]
+
+    difference = brier_difference(pairs)
+
+    assert difference is not None and difference.mean == pytest.approx(0.01 - 0.16)
+    assert difference.high < 0 and difference.n_races == 5
+
+
+def test_the_comparison_verdict_follows_the_confidence_interval_not_the_point(base_result):
+    from strategy.undercut_live import _verdict, brier_difference
+
+    better = brier_difference([pair_with(f"R{i}", 0.6, 0.9, 3.0, base_result) for i in range(5)])
+    worse = brier_difference([pair_with(f"R{i}", 0.9, 0.6, 3.0, base_result) for i in range(5)])
+    mixed = brier_difference(
+        [pair_with(f"R{i}", 0.6, 0.9 if i % 2 else 0.3, 3.0, base_result) for i in range(6)]
+    )
+
+    assert _verdict(better) == "a forma ao vivo erra menos que a antiga"
+    assert _verdict(worse) == "a forma ao vivo erra mais que a antiga"
+    assert _verdict(mixed) == "não se distingue da antiga nesta amostra"
+    assert _verdict(None) == "sem dados"
+
+
+def test_common_pairs_keep_only_the_events_that_are_primary_in_both_forms(race_live, base_result):
+    from strategy.undercut_live import common_pairs
+
+    key = (base_result.event.race, base_result.event.attacker, base_result.event.lap)
+    not_primary = replace(base_result, neutralized=True)
+
+    assert common_pairs([race_live], {key: base_result}) == [
+        (base_result, next(e.result for e in race_live.events[PRIMARY] if e.result is not None))
+    ]
+    assert common_pairs([race_live], {key: not_primary}) == []  # a antiga não é primária
+    assert common_pairs([race_live], {}) == []  # o evento não está na forma antiga
+
+
+def test_the_summary_is_generated_from_the_numbers_and_says_what_is_left_out(race_live):
+    text = flat(build_report([race_live], {}))
+
+    assert "## Resumo" in text
+    assert "Nenhum undercut contra o líder é avaliado nem alertado ao vivo" in text
+    assert "A precisão é otimista" in text and "não aplicado" in text
+
+
+def test_post_result_notes_are_listed_apart_from_the_adjustments(race_live):
+    text = flat(build_report([race_live], {}, notes=("acrescentei o resumo gerado",)))
+
+    assert "NÃO alteram o protocolo" in text and "- acrescentei o resumo gerado" in text
+    assert "Nenhum. O limiar e o fator de inflação são os congelados" in text
