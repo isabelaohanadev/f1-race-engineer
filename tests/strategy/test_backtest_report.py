@@ -25,6 +25,7 @@ from strategy.backtest_report import (
     section_laptime,
     section_leakage,
     section_sensitivity,
+    section_summary,
     section_undercut,
     section_variants,
     verdict_summary,
@@ -393,3 +394,60 @@ def test_the_limitations_are_always_in_the_report_good_result_or_bad():
 
         assert LIMITATIONS in report
         assert "3 eventos" in report and "VSC" in report and "heurísticas" in report
+
+
+# ------------------------------------------------------------------ o resumo
+
+
+def test_the_summary_says_beats_when_the_model_beats_both_comparators():
+    text = section_summary(
+        [o for o in outcomes(model=0.2, leader=0.6, mae=0.1, baseline=0.5)], FROZEN
+    )
+
+    assert "supera em 5 dos 5 horizontes, não se distingue em 0 e é pior em 0" in text
+    assert "o Monte Carlo supera em 10, não se distingue em 0 e é pior em 0" in text
+    assert "(diferença pareada" in text and ": supera)" in text
+    assert 'o veredito é "supera"' in text
+
+
+def test_the_summary_says_worse_with_all_the_letters_when_the_model_is_worse():
+    text = section_summary(outcomes(model=0.6, leader=0.2, mae=0.5, baseline=0.1), FROZEN)
+
+    assert "supera em 0 dos 5 horizontes, não se distingue em 0 e é pior em 5" in text
+    assert "supera em 0, não se distingue em 0 e é pior em 10" in text
+    assert ": é pior)" in text
+
+
+def test_the_summary_names_the_variants_that_the_rule_distinguishes():
+    none = section_summary(outcomes(), FROZEN)
+    one = section_summary(outcomes(variant_shift={"fisico": (-0.1, -0.05)}), FROZEN)
+
+    assert "Nenhuma variante se distingue do encolhimento" in none
+    assert "Distinguíveis do principal pela regra: fisico." in one
+
+
+def test_the_summary_reports_the_sc_rate_effect_in_plain_words():
+    insensitive = section_summary(outcomes(), FROZEN)
+    sensitive = section_summary(outcomes(sc_shift={2.0: 0.2}), FROZEN)
+
+    assert "taxa 0.5x: sem diferença detectável; taxa 2x: sem diferença detectável" in insensitive
+    assert "taxa 2x: Brier maior" in sensitive
+
+
+def test_the_summary_reads_the_leakage_sign_in_plain_words():
+    flattered = section_summary(outcomes(), FROZEN)  # o estado antigo foi fabricado com Brier menor
+
+    assert "Vazamento do estado por contagem de voltas" in flattered
+    assert "o estado antigo é mais otimista" in flattered
+
+
+def test_the_summary_comes_first_and_the_notes_come_last_without_touching_the_protocol():
+    report = build_report(
+        outcomes(), notes=("docs/backtest-diagnostico.md: o favorito do Monte Carlo",)
+    )
+
+    assert report.index("## Resumo") < report.index("## Valores congelados")
+    tail = report[report.index("## Ajustes pós-resultado") :]
+    assert "Nenhum valor do protocolo foi alterado" in tail
+    assert "NÃO alteram o protocolo" in tail and "o favorito do Monte Carlo" in tail
+    assert "NÃO alteram o protocolo" not in build_report(outcomes())

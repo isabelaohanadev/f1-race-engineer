@@ -33,6 +33,7 @@ from strategy.population import RaceKind, RaceRef
 from strategy.priors import DEFAULT_PRIORS, RaceStats
 from strategy.protocol import FROZEN, Protocol, frozen_sim_config, frozen_undercut_config
 from tests.strategy.synthetic import World, chase_field
+from tests.strategy.test_backtest_report import outcomes as report_outcomes
 
 TOTAL = 60
 FLAT = World(
@@ -364,7 +365,7 @@ def test_the_quick_flag_shrinks_the_run_and_is_labeled(monkeypatch, capsys):
 
     def fake_run(bundles, **kwargs):
         seen.update(kwargs)
-        return []
+        return report_outcomes()  # o relatório tem um resumo: precisa de corridas para resumir
 
     monkeypatch.setattr(backtest, "load_bundles", lambda session, rounds=None: [bundle()])
     monkeypatch.setattr(backtest, "get_session_factory", lambda: sessionmaker())
@@ -374,3 +375,24 @@ def test_the_quick_flag_shrinks_the_run_and_is_labeled(monkeypatch, capsys):
 
     assert seen["n_sims"] == 300 and seen["every"] == 20
     assert "VERIFICAÇÃO RÁPIDA" in capsys.readouterr().out
+
+
+def test_the_cache_written_by_python_dash_m_can_be_read_by_another_process(tmp_path):
+    """Com `python -m strategy.backtest` as classes do módulo viravam `__main__.RaceOutcome`, e o
+    cache gravado não podia ser relido. O ponto de entrada importa o módulo pelo nome."""
+    import subprocess
+    import sys
+
+    cache = tmp_path / "b.pkl"
+    code = (
+        "import sys; sys.argv = ['x']; import runpy; "
+        "from strategy import backtest; "
+        "from tests.strategy.test_backtest import bundle, QUICK; "
+        "outs = backtest.run_backtest([bundle()], workers=1, **QUICK); "
+        f"backtest.save_outcomes(outs, __import__('pathlib').Path({str(cache)!r}))"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True)
+
+    (loaded,) = load_outcomes(cache)
+
+    assert type(loaded).__module__ == "strategy.backtest"

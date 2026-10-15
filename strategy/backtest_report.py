@@ -609,25 +609,139 @@ def section_apart(apart: Sequence[RaceOutcome], protocol: Protocol) -> str:
     )
 
 
+def section_summary(main: Sequence[RaceOutcome], protocol: Protocol) -> str:
+    """O resumo, gerado dos mesmos números das seções: a redação segue as regras congeladas."""
+    headline = protocol.headline_variant
+    lines = []
+
+    # ---- tempo de volta contra a persistência
+    records = _records(main, headline, TEMPO)
+    by_horizon = {
+        h: paired_bootstrap(per_race(records, h, "mae"), per_race(records, h, "baseline_mae"))
+        for h in protocol.horizons
+    }
+    verdicts = Counter(verdict(d) for d in by_horizon.values())
+    one = by_horizon[protocol.horizons[0]]
+    lines.append(
+        "**Tempo de volta.** Contra a persistência (a mediana das 3 últimas voltas limpas do "
+        "piloto, "
+        f"sem modelo): o modelo supera em {verdicts.get('supera', 0)} dos {len(by_horizon)} "
+        f"horizontes, "
+        f"não se distingue em {verdicts.get('não supera', 0)} e é pior em "
+        f"{verdicts.get('é pior', 0)}. "
+        f"No horizonte de {protocol.horizons[0]} volta a diferença de erro absoluto (modelo menos "
+        f"persistência) é {fmt(one)} s."
+    )
+
+    # ---- Monte Carlo contra o líder
+    scores = _scores(main, headline, TEMPO)
+    rows = progress_rows(scores, n_boot=protocol.bootstrap_resamples)
+    model, leader = overall_brier(scores), overall_brier(scores, "leader_brier")
+    uniform = overall_brier(scores, "uniform_brier")
+    overall = paired_bootstrap(model, leader, seed=protocol.bootstrap_seed)
+    groups: dict[str, int] = Counter(r.verdict_leader for r in rows if r.n_races)
+    lines.append(
+        '**Probabilidade de vitória.** Contra "o líder atual vence", em '
+        f"{sum(groups.values())} faixas de andamento, o Monte Carlo supera em "
+        f"{groups.get('supera', 0)}, "
+        f"não se distingue em {groups.get('não supera', 0)} e é pior em {groups.get('é pior', 0)}. "
+        f"No geral o Brier é {fmt(cluster_bootstrap(model))} contra "
+        f"{fmt(cluster_bootstrap(leader))} "
+        f'(diferença pareada {fmt(overall)}: {verdict(overall)}). Contra "todos iguais" '
+        f"({fmt(cluster_bootstrap(uniform))}) o veredito é "
+        f'"{verdict(paired_bootstrap(model, uniform))}".'
+    )
+
+    # ---- as variantes de k e a taxa de SC
+    base_brier = overall_brier(_scores(main, headline, TEMPO))
+    base_mae = pooled_mae(_records(main, headline, TEMPO))
+    distinct = []
+    for variant in protocol.variants:
+        if variant == headline:
+            continue
+        d_brier = paired_bootstrap(overall_brier(_scores(main, variant, TEMPO)), base_brier)
+        d_mae = paired_bootstrap(pooled_mae(_records(main, variant, TEMPO)), base_mae)
+        if (
+            d_brier
+            and d_mae
+            and ((d_brier.high < 0 and d_mae.high < 0) or (d_brier.low > 0 and d_mae.low > 0))
+        ):
+            distinct.append(variant)
+    lines.append(
+        "**Variantes de k.** "
+        + (
+            f"Distinguíveis do principal pela regra: {', '.join(distinct)}."
+            if distinct
+            else "Nenhuma variante se distingue do encolhimento (sem diferença detectável)."
+        )
+    )
+    by_mult = {m: overall_brier(_scores(main, headline, TEMPO, m)) for m in protocol.sc_multipliers}
+    reading = {
+        "supera": "Brier menor",
+        "é pior": "Brier maior",
+        "não supera": "sem diferença detectável",
+    }
+    moves = [
+        f"taxa {m:g}x: {reading[verdict(paired_bootstrap(by_mult[m], by_mult[1.0]))]}"
+        for m in protocol.sc_multipliers
+        if m != 1.0 and 1.0 in by_mult
+    ]
+    lines.append(
+        "**Taxa de SC** (Brier contra a taxa de 1x, pareado por corrida): " + "; ".join(moves) + "."
+    )
+
+    # ---- o undercut ao vivo
+    flat = [r for v in _events(main, LIVE, TEMPO).values() for r in v]
+    live = summarize(flat, threshold=protocol.alert_threshold)
+    hits = round((live.precision or 0.0) * live.alerts) if live.alerts else 0
+    interval = wilson(hits, live.alerts)
+    lines.append(
+        f"**Undercut ao vivo** ({live.n_primary} eventos primários de {live.n_events}). "
+        + (
+            f"{live.alerts} alertas no limiar de {protocol.alert_threshold}, {hits} deram certo "
+            f"(precisão {hits / live.alerts:.0%}, Wilson {interval[0]:.0%} a {interval[1]:.0%}); "
+            if interval
+            else "Nenhum alerta no limiar; "
+        )
+        + f"Brier {num(live.brier)} contra {num(live.brier_baseline)} de quem prevê sempre a "
+        "taxa-base; "
+        f"cobertura do intervalo de 90% da margem: {num(live.coverage_90, 2)}. **Precisão "
+        f"otimista** "
+        "(só as paradas que aconteceram) e revocação não mensurável."
+    )
+
+    # ---- o vazamento
+    brier_v = overall_brier(_scores(main, headline, VOLTA))
+    leak = paired_bootstrap(brier_v, base_brier)
+    if leak is not None and leak.high < 0:
+        reading_leak = "o estado antigo é mais otimista"
+    elif leak is not None and leak.low > 0:
+        reading_leak = "o estado antigo é mais pessimista"
+    else:
+        reading_leak = "sem diferença detectável"
+    lines.append(
+        "**Vazamento do estado por contagem de voltas.** O Brier da vitória com o estado antigo "
+        f"menos o do estado no instante t: {fmt(leak)} ({reading_leak})."
+    )
+    return "\n\n".join(lines) + "\n"
+
+
 LIMITATIONS = """\
 - **O SC depois da volta 10 vem de 3 eventos** (8 períodos de SC em 7 das 21 corridas secas, 5 deles
-nas
-  voltas 1 a 7). As paradas sob SC são 15 e a razão de custo (0,58) tem desvio de ~0,4.
+  nas voltas 1 a 7). As paradas sob SC são 15 e a razão de custo (0,58) tem desvio de ~0,4.
 - **As regras de parada, de ultrapassagem e o desgaste sob SC são heurísticas**, não medidas:
-equipes
-  decidem por rivais, tráfego e estratégia que o ganho de tempo não vê.
+  equipes decidem por rivais, tráfego e estratégia que o ganho de tempo não vê.
 - **VSC (8 períodos) e bandeira vermelha (2) ficam fora do simulador**, e abandono não causa SC.
 - **Vinte e uma corridas** é uma amostra pequena: os intervalos de bootstrap são largos, e o poder
-para
-  distinguir variantes ou comparadores é baixo.
-- **Uma só temporada** (2024), um só conjunto de regras: nada garante que o resultado vale para
-2025.
+  para distinguir variantes ou comparadores é baixo.
+- **Uma só temporada** (2024) e um só conjunto de regras: nada garante que o resultado vale para
+  2025.
 - **O viés do undercut** (só as paradas que aconteceram): a precisão é otimista e a revocação não é
   mensurável.
 - **As constantes (perda no pit, SC, abandonos, trocas)** saem das outras 20 corridas, não só das
   anteriores no calendário, o que ao vivo não se saberia.
 - **O estado por instante** exclui quem não cruza a linha há mais de duas voltas típicas
-(heurística).
+  (heurística).
 """
 
 
@@ -636,6 +750,7 @@ def build_report(
     protocol: Protocol = FROZEN,
     *,
     adjustments: Sequence[str] = (),
+    notes: Sequence[str] = (),
     generated_on: date | None = None,
     quick: bool = False,
 ) -> str:
@@ -651,6 +766,12 @@ def build_report(
         adjusted = "\n".join(f"- {a}" for a in adjustments)
     else:
         adjusted = "Nenhum. Nenhum valor do protocolo foi alterado depois de ver o resultado."
+    if notes:
+        adjusted += (
+            "\n\n**Análises e correções feitas depois do resultado, que NÃO alteram o protocolo "
+            "nem o "
+            "que foi medido:**\n\n" + "\n".join(f"- {n}" for n in notes)
+        )
     return (
         "# Backtest da Fase 3: previsão do tempo de volta, Monte Carlo e alerta de undercut\n\n"
         f"{banner}"
@@ -658,6 +779,8 @@ def build_report(
         f"({len(main)} corridas secas com leave-one-race-out e {len(apart)} fora delas; "
         f"{seconds:.0f} s de CPU). O protocolo foi **congelado antes** de ver o resultado "
         "(`docs/backtest-protocolo.md`).\n\n"
+        "## Resumo\n\n"
+        f"{section_summary(main, protocol)}\n"
         "## Valores congelados\n\n"
         f"{section_frozen(protocol)}\n"
         "## 1. Erro de previsão do tempo de volta\n\n"

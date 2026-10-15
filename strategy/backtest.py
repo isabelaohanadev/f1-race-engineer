@@ -261,6 +261,12 @@ def main(argv: list[str] | None = None) -> int:
         "--quick", action="store_true", help="verificação: 300 simulações, 1 volta em 20"
     )
     parser.add_argument(
+        "--note",
+        action="append",
+        default=[],
+        help="análise ou correção feita depois do resultado, sem alterar o protocolo (repetível)",
+    )
+    parser.add_argument(
         "--adjustment",
         action="append",
         default=[],
@@ -292,7 +298,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(outcomes)} corridas em {time.perf_counter() - started:.0f} s", file=sys.stderr)
         if args.cache is not None:
             save_outcomes(outcomes, args.cache)
-    report = build_report(outcomes, adjustments=tuple(args.adjustment), quick=args.quick)
+    report = build_report(
+        outcomes, adjustments=tuple(args.adjustment), notes=tuple(args.note), quick=args.quick
+    )
     print(report)
     if args.markdown is not None:
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
@@ -302,4 +310,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Com `python -m`, as classes deste arquivo viram `__main__.RaceOutcome` e o cache gravado não
+    # poderia ser relido por outro processo. Importar o módulo pelo nome devolve as classes certas.
+    from strategy.backtest import main as _main
+
+    sys.exit(_main())
