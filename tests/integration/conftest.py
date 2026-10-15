@@ -219,3 +219,37 @@ def synthetic_race(engine: Engine) -> sessionmaker:
     ]
     seed_race(engine, positions=positions, laps=laps, total_laps=4)
     return sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest.fixture(scope="session")
+def race_rows():
+    """A corrida sintética (14 carros, 40 voltas) dos testes do consumidor de estratégia."""
+    from tests.integration.strategy_helpers import make_rows
+
+    return make_rows()
+
+
+@pytest.fixture
+def consumer_subprocess(redis_test_settings, migrated_db_name: str):
+    """O consumidor de verdade (`python -m strategy.service`) num processo à parte, apontando para o
+    Redis de teste e para o banco descartável (vazio: as constantes saem dos padrões)."""
+    env = {
+        **os.environ,
+        "POSTGRES_DB": migrated_db_name,
+        "REDIS_DB": str(redis_test_settings.db),
+        "STRATEGY_METRICS_PORT": "0",
+        "STRATEGY_WAIT_S": "0.05",
+        "STRATEGY_LOCK_TTL_MS": "800",
+        "STRATEGY_N_SIMS": "300",
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-m", "strategy.service"],
+        env=env,
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    yield process
+    if process.poll() is None:
+        process.kill()
+    process.wait(10)

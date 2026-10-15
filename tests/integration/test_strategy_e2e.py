@@ -19,7 +19,7 @@ from replay.engine import ReplayState
 from replay.manager import ReplayManager
 from strategy.service.results import ResultStore
 from tests.integration.helpers import RACE, wait_until
-from tests.integration.test_strategy_consumer import TOTAL, make_consumer, running
+from tests.integration.strategy_helpers import TOTAL, make_consumer, running
 from tests.replay.fakes import FakeClock
 from tests.strategy.synthetic import World, chase_field
 
