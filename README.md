@@ -744,9 +744,14 @@ Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
   provisório e vem da calibração da inclinação, não da margem; a regra de ultrapassagem (0,7 s/volta de
   vantagem, 0,7 s de distância) é uma heurística; os outros carros não param no horizonte; o composto
   seguinte é o mais provável, não o escolhido.
-- **Viés da avaliação que vem a seguir:** só se observam as paradas que aconteceram, e as equipes
-  tendem a parar quando funciona. Medir precisão e calibração só nelas é otimista e não mede
-  revocação. Será dito junto com o número.
+- **A avaliação nas paradas reais está pronta e ainda não foi rodada** (`python -m strategy.undercut_eval`,
+  protocolo em `docs/undercut.md`; roda no backtest da etapa 8). Cada parada real é um evento, o
+  resultado real sai dos relógios, as constantes saem sem a corrida avaliada e o fator de inflação é
+  calibrado só nas outras corridas. **O viés:** só se observam as paradas que aconteceram, e as equipes
+  tendem a parar quando funciona; a precisão medida é otimista, a revocação não é mensurável, e a
+  calibração é condicional a "a equipe decidiu parar". Uma execução numa corrida real (Miami) achou só 2
+  eventos, ambos sob pista não verde: a amostra limpa por corrida é pequena, e o relatório mostra o `n`
+  de cada faixa.
 
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
@@ -895,7 +900,7 @@ replay/         motor de replay: fonte (keyset), timeline, engine, publisher, es
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
 strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo,
-                undercut
+                undercut e a avaliação dele (undercut_eval)
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

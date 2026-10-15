@@ -124,10 +124,57 @@ o resultado muda (o teste morde).
   ritmo com efeito fixo de volta, que não fiz.
 - **O fator de inflação 1,3 é provisório.**
 
-## Nota para a avaliação (etapa 8): o viés de só observar o que aconteceu
+## A avaliação nas paradas reais (preparada; roda na etapa 8)
 
-Só se observam as paradas que **aconteceram**, e as equipes tendem a parar quando o undercut funciona.
-Avaliar o modelo só nelas tem dois vieses: (1) os casos em que o undercut **não** funcionaria e ninguém
-parou não aparecem, então a precisão medida é otimista e a revocação nem é mensurável; (2) o resultado
-real depende de ações dos dois lados (o rival respondeu? a equipe adiou?). A avaliação em
-`strategy/undercut_eval.py` mede precisão e calibração só nas paradas reais e registra isso.
+Código: `strategy/undercut_eval.py` (`python -m strategy.undercut_eval`). Testes:
+`tests/strategy/test_undercut_eval.py` (45 testes, corridas sintéticas em que o undercut acontece no
+gerador; 20 mutações derrubam todas um teste, e uma sobrevivente da 1ª rodada, o limiar inclusivo
+`>=`, ganhou o teste do valor exatamente no limiar).
+
+**Protocolo.** Cada parada de um piloto na volta `s` é um evento: decide-se na volta N = s − 1, o rival é
+o carro à frente (pelo relógio), e o resultado real é quem está à frente ao fim da volta `s_r + 2`, em que
+`s_r` é a volta em que o rival de fato parou (a mesma N+K+2 da margem prevista). A margem realizada é a
+diferença dos relógios; "sucesso" = o atacante terminou à frente. Medidas: **Brier** (e o do "sempre a
+taxa-base", o piso a bater), **curva de calibração** por faixa de probabilidade (com os cortes 0,5 e 0,6
+do alerta), **precisão no limiar**, erro da margem (viés, erro absoluto) e **cobertura do intervalo de
+90%** da margem realizada.
+
+**Dois modos.** `oráculo` (padrão) usa o horizonte e os compostos que de fato aconteceram: mede a física
+do modelo (ritmo, degradação, perda, tráfego). `--live` usa o que o sistema saberia na volta N (horizonte
+esperado, composto mais provável): é o que decide o alerta e erra mais; a diferença é o custo de não saber
+o que o rival fará.
+
+**Sem vazamento.** Cada evento usa `build_context` na volta N (corta o futuro; testado: a avaliação é
+igual à de uma corrida que parou em N) e as constantes **sem a corrida avaliada** (`leave_one_out`,
+testado com um espião: a corrida diferente não entra na reserva dela). O **fator de inflação é calibrado
+só nas outras corridas** (`loo_inflation`): a margem e o desvio cru ficam guardados em cada resultado, e
+refazer a probabilidade com outro fator não reavalia nada. Piso de 1,0: é um fator de inflação, e uma
+amostra pequena não deve desinflar; o que os dados pedem vai ao relatório.
+
+**O que entra na média (eventos primários).** Sem regra dura de não alertar e **sem pista não verde** entre
+N−1 e a volta final (uma parada sob SC não é comparável). Os outros aparecem em linha à parte, com o
+motivo. São descartados na busca: rival que não parou, parou na mesma volta, parou num horizonte fora de
+[3, 10] voltas, estava em outro stint, parada extra de qualquer um na janela, corrida que acaba antes.
+
+### O viés que o relatório não finge tirar
+
+Só se observam as paradas que **aconteceram**, e as equipes tendem a parar quando o undercut funciona:
+
+1. a taxa de sucesso entre as paradas observadas é **maior** que a de todas as situações em que um
+   atacante estava atrás de um rival (as em que não funcionaria, ninguém parou, e não aparecem);
+2. a **precisão** medida é otimista, e a **revocação** (dos undercuts que dariam certo, quantos o modelo
+   alertou) **não é mensurável**: o denominador não existe;
+3. a calibração é **condicional** a "a equipe decidiu parar": diz se, nas paradas feitas, a probabilidade
+   bate com a frequência, e não se vale para uma situação qualquer;
+4. o resultado real também depende do que os dois lados fizeram depois; por isso as paradas extras na
+   janela são descartadas.
+
+### Um aviso de poder estatístico, já visível
+
+Uma execução do pipeline completo numa corrida real (Miami, **só para ver que roda**, sem interpretar
+números) achou **2 eventos**, **ambos sob pista não verde** (0 primários); descartou 26 paradas por
+motivos estruturais (7 com horizonte fora de [3, 10], 7 sem o rival parar depois, 4 paradas na mesma
+volta, 4 com o rival em outro stint, 3 sem rival à frente, 1 com parada extra). Isto vale como alerta: com
+poucos eventos limpos por corrida, a curva de calibração por faixa vai ter faixas com pouquíssimos casos.
+O relatório mostra `n` por faixa justamente para ninguém ler uma frequência de 1 em 2 como calibração.
+Não ampliei os critérios (K fora de [3, 10], eventos sob SC) para inflar a amostra: isso mudaria a pergunta.
