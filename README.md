@@ -143,11 +143,15 @@ flowchart LR
     MIG -- "terminou com sucesso" --> APP["app<br/>uvicorn :8000<br/>REST, WebSocket e /metrics"]
     RED["redis<br/>Redis 8.6.7<br/>127.0.0.1:6379"] -- "healthy" --> APP
     RED -- "healthy" --> WRK["worker (N cópias)<br/>python -m worker<br/>/metrics :9108"]
+    RED -- "healthy" --> STR["strategy (2 cópias, 1 ativa)<br/>python -m strategy.service<br/>/metrics :9109"]
+    MIG -- "terminou com sucesso" --> STR
 ```
 
 A migration é um **job separado** (e não parte do startup do app) para que, com várias réplicas,
 ela rode exatamente uma vez por `up` em vez de várias disputando o mesmo schema. O worker recebe só
-as variáveis do Redis: não tem a senha do Postgres.
+as variáveis do Redis: não tem a senha do Postgres. O consumidor de estratégia (Fase 3) precisa do
+Postgres também (as constantes do modelo saem do banco) e sobe com **duas cópias, das quais só uma
+calcula** (lock + standby, ver `docs/estrategia-ao-vivo.md`).
 
 ### Ingestão (Fase 1)
 
@@ -381,7 +385,23 @@ curl      localhost:8000/replay/2024/21                  # status: estado, veloc
 curl -X POST localhost:8000/replay/2024/21/stop
 ```
 
-### 6. Métricas
+### 6. Estratégia ao vivo (Fase 3)
+
+Com o replay rodando (passo 4, numa das corridas com replay: 2024 etapas 6, 10, 13 ou 16; o Brasil
+é chuva, fora do domínio do modelo), o serviço `strategy` calcula a cada volta do líder, a partir da
+volta 5:
+
+```bash
+curl -s "localhost:8000/races/2024/10/strategy" | python -m json.tool   # a volta mais recente
+curl -s "localhost:8000/races/2024/10/strategy?lap=20"                  # uma volta
+python scripts/watch_race.py --year 2024 --round 10                     # o Monte Carlo ao lado do líder atual
+```
+
+A página (`/frontend/`) tem o painel "Estratégia". **Leia "O backtest" antes de confiar no número:
+o Monte Carlo não superou "o líder atual vence".** Detalhes e limitações em
+`docs/estrategia-ao-vivo.md`.
+
+### 7. Métricas
 
 ```bash
 curl -s localhost:8000/metrics | grep -E "^f1_"                  # API
@@ -419,7 +439,8 @@ python -m worker                  # terminal 2: o worker (inicie mais cópias se
 | `POST /replay/{year}/{round}/pause` `/resume` `/stop` | Pausa (congela o tempo de corrida), retoma de onde parou, encerra | `200` com o status · `409` não há replay ativo · `504` o dono não respondeu |
 | `POST /replay/{year}/{round}/speed` | Muda para 1x, 4x ou 16x sem reiniciar nem pular | `200` · `409` · `422` · `504` |
 | `GET /replay/{year}/{round}` | Status do replay, lido do Redis (vale de qualquer instância) | `200` · `404` nunca iniciado ou expirado |
-| `WS /ws/races/{year}/{round}` | Snapshot do estado e, depois, os eventos em tempo real | fecha com `1013` se o cliente for lento |
+| `GET /races/{year}/{round}/strategy?lap=N` | Estratégia de uma volta do líder (sem `lap`: a mais recente): Monte Carlo **ao lado de "o líder atual vence"**, voltas que faltam, `reliability`, alertas de undercut e avisos de pista. **Só lê** o que o consumidor de estratégia gravou | `200` · `404` ainda sem resultado (a mensagem diz de onde ele vem) · `422` `lap` inválida · `500` formato que a API não entende |
+| `WS /ws/races/{year}/{round}` | Snapshot do estado e, depois, os eventos em tempo real (inclusive o `strategy`) | fecha com `1013` se o cliente for lento |
 | `GET /frontend/` | Página de teste do WebSocket (HTML + JS, servida pela API) | `200` |
 
 Regras que valem a pena conhecer:
@@ -454,9 +475,20 @@ abaixo estão abreviados (o snapshot real traz todos os carros e todos os campos
 {"type": "race_status",   "id": "1730649000131-0", "epoch": 3, "state": "running", "lap": 4, "total_laps": 69, "t": 1730649001000}
 ```
 
-`t` é o instante da corrida em milissegundos Unix (UTC); `id` é o ID da entrada no stream. Quem
-escreve um cliente precisa seguir **quatro regras** (todas implementadas em `RaceView`, em
-`scripts/watch_race.py`):
+```json
+{"type": "strategy", "v": 1, "id": "1730649000140-0", "epoch": 3, "lap": 30, "total_laps": 66,
+ "laps_left": 36, "reliability": "indicative",
+ "baseline": {"name": "o líder atual vence", "leader": "VER"},
+ "forecast": {"drivers": [{"driver": "VER", "win": 0.62, "baseline_win": 1.0, "podium": 0.97}]},
+ "alerts": [], "warnings": [], "inputs": {"cars_reported": 20, "cars_known": 20}}
+```
+
+`t` é o instante da corrida em milissegundos Unix (UTC); `id` é o ID da entrada no stream. O evento
+`strategy` (abreviado acima; o formato completo está em `docs/estrategia-ao-vivo.md`) chega uma vez
+por volta calculada do líder, e quem **entra no meio** recebe o último logo depois do snapshot.
+**Mostre sempre `baseline_win` ao lado de `win`**: no backtest o Monte Carlo não superou "o líder
+atual vence" (ver "O backtest"). Quem escreve um cliente precisa seguir **cinco regras** (todas
+implementadas em `RaceView`, em `scripts/watch_race.py`, e na página):
 
 1. **Epoch.** Um evento com `epoch` **maior** que o seu é de um replay novo: descarte o estado e
    recomece. Um com epoch **menor** é de um replay antigo: ignore.
@@ -466,15 +498,19 @@ escreve um cliente precisa seguir **quatro regras** (todas implementadas em `Rac
 3. **Status da corrida.** Só avança em (volta, estado): `started` < `running` < `finished`.
 4. **Classificação** (derivada): mais voltas completas primeiro; empatando, quem cruzou a linha
    antes. É a ordem **na pista** (ver as limitações).
+5. **Estratégia.** Vale o `strategy` de **maior `lap`** do epoch atual (o repetido ou atrasado não
+   volta atrás) e só se `v` é uma versão que o cliente conhece; uma versão nova deve ser **dita**, não
+   adivinhada.
 
 Códigos de fechamento: `1013` (tente de novo: o cliente não acompanhou a velocidade dos eventos; ao
 reconectar ele recebe um snapshot novo) e `1011` (Redis indisponível).
 
 ## Métricas
 
-Cada processo expõe as **suas** métricas: a API em `/metrics` e o worker em
-`:9108/metrics` (porta configurável por `WORKER_METRICS_PORT`, `0` desliga). No Compose a porta do
-worker é publicada em `127.0.0.1` com número sorteado (funciona com `--scale worker=N`): descubra com
+Cada processo expõe as **suas** métricas: a API em `/metrics`, o worker em `:9108/metrics` (porta
+configurável por `WORKER_METRICS_PORT`, `0` desliga) e o consumidor de estratégia em `:9109/metrics`
+(`STRATEGY_METRICS_PORT`). No Compose a porta do worker e a do consumidor são publicadas em
+`127.0.0.1` com número sorteado (funciona com várias cópias): descubra com
 `docker compose port --index 1 worker 9108`.
 
 | Métrica | Tipo | Onde | O que mede |
@@ -491,6 +527,11 @@ worker é publicada em `127.0.0.1` com número sorteado (funciona com `--scale w
 | `f1_worker_events_total{result}` | counter | worker | `applied`, `ignored` (a trava de ordem em ação) e `malformed` |
 | `f1_worker_claimed_total` | counter | worker | Entradas resgatadas de um worker que sumiu (`XAUTOCLAIM`) |
 | `f1_worker_apply_latency_seconds` | histograma | worker | Publicação até o estado gravado: o quão fresco está o snapshot |
+| `f1_strategy_consumer_active` | gauge | estratégia | `1` na instância que segura o lock, `0` em standby (a soma entre as cópias deve ser 1) |
+| `f1_strategy_last_result_age_seconds` | gauge | estratégia | Idade do último resultado **gravado** (NaN antes do primeiro): sobe com o replay pausado ou a simulação travada |
+| `f1_strategy_simulation_duration_seconds{result}` | histograma | estratégia | Duração da simulação (`completed`, `cancelled`, `stale`, `failed`) |
+| `f1_strategy_laps_total{outcome}` | counter | estratégia | Voltas lidas: `applied`, `duplicate`, `late`, `stale_epoch`, `status`, `ignored`, `malformed` |
+| `f1_strategy_results_total{outcome}` | counter | estratégia | Entregas: `written`, `exists`, `fenced`, `skipped`, `dropped` |
 
 Detalhes que importam:
 
@@ -500,9 +541,9 @@ Detalhes que importam:
   dar errado.
 - **O lag sai da API, não do worker**: é a métrica que alerta "os workers não dão conta". Se
   dependesse do worker, quando *todos* morressem (o pior caso) ela sumiria junto.
-- **Cardinalidade:** os únicos rótulos são `race`, `group` e `result` (poucos valores). Piloto, ID de
-  evento, nome de consumidor ou cliente **nunca** viram rótulo (seriam milhares de séries). Há um
-  teste que varre os registros e falha se isso mudar.
+- **Cardinalidade:** os únicos rótulos são `race`, `group`, `result` e `outcome` (poucos valores
+  fixos). Piloto, ID de evento, nome de consumidor ou cliente **nunca** viram rótulo (seriam milhares
+  de séries). Há um teste que varre os registros e falha se isso mudar.
 - **Se o Redis cair**, o `/metrics` não falha: `f1_redis_up` vai a `0` e o resto continua exposto.
 - `/metrics` não tem autenticação (não há dado sensível); em produção restrinja o acesso na borda.
 
@@ -514,12 +555,16 @@ scrape_configs:
     static_configs: [{targets: ["app:8000"]}]
   - job_name: f1-worker
     dns_sd_configs: [{names: ["worker"], type: A, port: 9108}]   # uma instância por cópia
+  - job_name: f1-strategy
+    dns_sd_configs: [{names: ["strategy"], type: A, port: 9109}]  # a ativa e a standby
 ```
 
 ```promql
 sum(rate(f1_replay_events_published_total[1m]))                                   # eventos/s
 max by (race) (f1_consumer_group_lag)                                             # alerta se subir e não descer
 histogram_quantile(0.99, sum by (le) (rate(f1_delivery_latency_seconds_bucket[1m])))   # p99 de entrega
+sum(f1_strategy_consumer_active)                                                  # deve ser exatamente 1
+max(f1_strategy_last_result_age_seconds)                                          # alerta se passar de ~2 voltas com replay rodando
 ```
 
 ### Por que não o modo multiprocess do `prometheus-client`
@@ -552,13 +597,16 @@ pytest                            # tudo; requer banco e Redis (docker compose u
   colunas e tipos do FastF1; o motor de replay usa um **relógio injetado** (nada de `sleep` real, o
   teste roda uma hora de corrida em milissegundos e confere o instante exato de cada evento). O
   `tests/test_frontend.py` roda o JS da página no `node` e o compara com o cliente Python em 60
-  cenários aleatórios (é pulado se o `node` não existir).
+  cenários aleatórios, executa o script da página com um DOM de mentira e confere o painel de
+  estratégia (é pulado se o `node` não existir).
 - **Integração** (marker `integration`): **TimescaleDB e Redis reais**. Cada execução cria um banco
   descartável (a migration roda de verdade) e usa o banco lógico 15 do Redis, esvaziado a cada
   teste, então seus dados de desenvolvimento nunca são tocados. Cobrem o que um dublê não alcança:
   a hypertable, o `ON CONFLICT`, o script Lua, o consumer group, o `XAUTOCLAIM`, o controle entre
   processos e um servidor `uvicorn` **real** com clientes WebSocket reais entrando no meio de um
-  replay.
+  replay. O consumidor de estratégia tem os dele contra o Redis real: a queda com um `SIGKILL` de
+  verdade, o lock e o standby, o epoch, a duplicata, o embaralhamento e a cadeia inteira (banco,
+  replay, consumidor, hub, WebSocket e `GET`).
 - Sem banco/Redis acessível, os de integração são **pulados** com a instrução de como subir; com
   `REQUIRE_INTEGRATION_DB=1` (o que o CI usa) eles **falham**, para nunca passarem em silêncio.
 - **Por que Redis real, e não `fakeredis` ou `testcontainers`:** o que precisa de prova (Lua,
@@ -858,6 +906,36 @@ Relatório completo e gerado dos números: `docs/backtest.md`. **O resultado é 
   que** o Monte Carlo perde para o líder atual no fim da corrida: as ablações só descartam a
   dispersão, não apontam a causa.
 
+#### A estratégia ao vivo: o consumidor, o stream de voltas e o evento `strategy`
+
+`docs/estrategia-ao-vivo.md` (o caminho dos dados, o payload, os testes e o que não foi validado). Um
+consumidor (`python -m strategy.service`, um processo à parte da API e do worker de estado) calcula, a
+cada volta do líder durante um replay, o Monte Carlo e os alertas de undercut, e os entrega por
+`GET /races/{ano}/{etapa}/strategy` e pelo evento `strategy` do WebSocket.
+
+- **Stream de voltas separado** (`laps:{ano}:{etapa}`): o principal é ~99% posições e é aparado; a
+  estratégia precisa das ~1.400 voltas e do histórico inteiro. Entra na mesma transação do principal;
+  o contrato do WebSocket não mudou.
+- **Uma instância ativa, com lock e standby.** A que segura o lock `strategy:consumer:lock` calcula; a
+  outra assume pelo TTL de uma queda (ou na hora, num `SIGTERM`), **reconstruindo o estado do stream**
+  (que guarda a corrida inteira), não do consumer group. Perdeu o lock, para de entregar.
+- **A mesma função do backtest** (`state_until` via `prepare`/`build_context`): o resultado ao vivo é
+  numericamente o do backtest, também pelo Redis (testado).
+- **Dedupe por (piloto, volta), janela de espera configurável, volta atrasada** (fica no estado, não
+  reabre o resultado já calculado) e **epoch** (replay novo zera estado, alertas e resultados). Teste:
+  a mesma corrida com as entradas embaralhadas dentro da janela guarda os mesmos números.
+- **Payload versionado (`v`)**, com o comparador "o líder atual vence" (`baseline_win`) ao lado do
+  Monte Carlo, as voltas que faltam e `reliability`: **`indicative`** até 80% da corrida (no backtest
+  o Monte Carlo **não se distinguiu** do comparador) e **`experimental`** depois (no backtest ele foi
+  **pior**). Os avisos de SC, VSC e bandeira vermelha vão no evento (VSC e vermelha estão fora do
+  simulador). A ressalva do viés de seleção dos alertas está na documentação do campo (`/docs`).
+- **O `GET` só lê**: nunca calcula, e um teste confere que ele não cria nenhuma chave no Redis.
+- **O que NÃO validei:** o serviço no Compose (não há Docker CLI aqui: o processo real foi testado
+  contra o Redis e o Timescale reais, com um `SIGKILL` de verdade, mas não o `docker compose up`);
+  **os alertas ao vivo são avaliados no instante do líder, e o backtest os mediu no do atacante** (a
+  precisão de 83% não vale para esta forma); o backtest mediu as voltas 5, 10, 15…, e ao vivo
+  calcula-se toda volta; só 5 das 24 corridas têm replay (as outras vieram de `--laps-only`).
+
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
 
@@ -939,6 +1017,11 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
   margem cobre 81% porque o fator de inflação (1,3, congelado antes) é baixo: os dados pedem 1,87. Os
   limiares (0,6 liga, 0,5 desliga), a regra de ultrapassagem e o horizonte `K` continuam sem calibração
   própria (`docs/undercut.md`, `docs/backtest.md`).
+- **Estratégia ao vivo: o Monte Carlo ao vivo carrega as limitações do backtest** (acima), e o
+  resultado traz `reliability` e o comparador para que ninguém o leia como melhor que a posição na
+  pista. Os alertas ao vivo são avaliados no instante do líder (o backtest, no do atacante); a
+  histerese do alerta não sobrevive a uma troca de instância; só 5 corridas têm replay; o serviço
+  `strategy` do Compose não foi executado por mim (`docs/estrategia-ao-vivo.md`).
 - **O backtest cobre uma temporada (2024), 21 corridas secas** e as constantes de cada corrida vêm das
   outras 20, não só das anteriores no calendário; a britânica, o Canadá e o Brasil são avaliados à
   parte (uma corrida cada, sem intervalo).
@@ -1016,7 +1099,9 @@ strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustí
                 snapshot (o estado até o instante t), undercut e a avaliação dele (undercut_eval),
                 history (SC, abandonos, compostos), montecarlo, forecast_runner (executor
                 só-a-última), forecast_eval, laptime_eval, protocol (as constantes congeladas),
-                backtest e backtest_report, diagnostics (pós-resultado), metrics
+                backtest e backtest_report, diagnostics (pós-resultado), metrics, live (o estado ao
+                vivo de uma corrida, puro) e payload (o resultado versionado)
+strategy/service/  o consumidor de estratégia (Redis, lock, standby): consumer, results, constants
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket
