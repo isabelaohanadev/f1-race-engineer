@@ -625,3 +625,16 @@ def test_the_threshold_of_the_cli_reaches_the_config(monkeypatch):
     undercut_eval.main(["--threshold", "0.7"])
 
     assert isinstance(seen["config"], UndercutConfig) and seen["config"].threshold == 0.7
+
+
+def test_an_event_without_the_attackers_clock_is_skipped_and_never_falls_back_to_the_old_state():
+    """No estado por instante, sem o relógio do atacante na volta N não há instante: o evento é
+    descartado com motivo, e não avaliado em silêncio com o estado antigo (que vazaria o futuro)."""
+    rows = real_race()
+    event_clock = {(r.driver, r.lap_number): r for r in rows}[("A", N)]
+    broken = [replace(r, session_time_ms=None) if r is event_clock else r for r in rows]
+
+    results, skipped = evaluate_race(broken, TOTAL, race="X", priors=EXACT)
+
+    assert not [r for r in results if r.event.attacker == "A"]
+    assert skipped["sem relógio do atacante"] >= 1

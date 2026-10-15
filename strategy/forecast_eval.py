@@ -47,7 +47,14 @@ from strategy.history import (
     load_race_histories,
 )
 from strategy.laps import LapRow, load_race_laps
-from strategy.montecarlo import PODIUM_SIZE, RaceForecast, SimConfig, prepare, simulate
+from strategy.montecarlo import (
+    PODIUM_SIZE,
+    RaceForecast,
+    SimConfig,
+    prepare,
+    sensitivity,
+    simulate,
+)
 from strategy.population import RaceRef, split_population
 from strategy.priors import DEFAULT_PRIORS, Priors, RaceStats, leave_one_out
 from strategy.race_stats import load_race_stats
@@ -73,6 +80,9 @@ class LapScore:
     favorite_won: bool
     leader_brier: float  # "o líder atual vence": p = 1 para ele
     uniform_brier: float  # "todos iguais": p = 1/n
+    # (probabilidade, aconteceu) de cada piloto, para a curva de calibração
+    win_pairs: tuple[tuple[float, bool], ...] = ()
+    podium_pairs: tuple[tuple[float, bool], ...] = ()
 
     @property
     def progress(self) -> float:
@@ -110,6 +120,10 @@ def score_forecast(
         favorite_won=favorite == winner,
         leader_brier=leader_brier,
         uniform_brier=uniform_brier,
+        win_pairs=tuple((p, driver == winner) for driver, p in wins.items())
+        + (() if winner in wins else ((0.0, True),)),
+        podium_pairs=tuple((q, driver in podium) for driver, q in podiums.items())
+        + tuple((0.0, True) for driver in sorted(podium) if driver not in podiums),
     )
 
 
@@ -137,8 +151,7 @@ def evaluate_race(
     """As notas de cada volta de `laps` da corrida, com as constantes dadas (as SEM a corrida).
 
     `snapshot="tempo"` (o padrão): o estado no instante em que o líder completa a volta. `"volta"`:
-    o
-    estado antigo, por contagem de voltas, que dá aos de trás informação de depois desse
+    o estado antigo, por contagem de voltas, que dá aos de trás informação de depois desse
     instante."""
     order = on_track_order(rows)
     if len(order) < MIN_DRIVERS:
@@ -167,6 +180,58 @@ def evaluate_race(
             )
         )
     return scores
+
+
+def evaluate_race_configs(
+    rows: Sequence[LapRow],
+    ref: RaceRef,
+    *,
+    laps: Sequence[int],
+    priors: Priors,
+    sim_priors: SimPriors,
+    configs: Sequence[tuple[FuelVariant, str, Sequence[float]]],
+    config: SimConfig,
+) -> dict[tuple[str, str, float], list[LapScore]]:
+    """Várias configurações na mesma corrida e nas mesmas voltas. Cada configuração é (variante de
+    k,
+    estado ("tempo" ou "volta"), multiplicadores da taxa de SC); a chave do resultado é (variante,
+    estado, multiplicador). Os multiplicadores de uma configuração usam os MESMOS números
+    aleatórios, e
+    as variantes de k também (os sorteios só dependem de corrida, volta e número de pilotos)."""
+    order = on_track_order(rows)
+    out: dict[tuple[str, str, float], list[LapScore]] = {
+        (variant.value, snapshot, m): []
+        for variant, snapshot, multipliers in configs
+        for m in multipliers
+    }
+    if len(order) < MIN_DRIVERS:
+        return out
+    for lap in laps:
+        if not 1 <= lap < ref.total_laps:
+            continue
+        leader = current_leader(rows, lap)
+        for variant, snapshot, multipliers in configs:
+            try:
+                inp = prepare(
+                    rows,
+                    year=ref.year,
+                    round=ref.round,
+                    upto_lap=lap,
+                    total_laps=ref.total_laps,
+                    sim_priors=sim_priors,
+                    priors=priors,
+                    variant=variant,
+                    snapshot=snapshot,
+                )
+            except ValueError:  # ninguém completou a volta
+                continue
+            if len(inp.drivers) < MIN_DRIVERS:
+                continue
+            for m, forecast in sensitivity(inp, config, tuple(multipliers)).items():
+                out[(variant.value, snapshot, m)].append(
+                    score_forecast(forecast, order, race=ref.label, current_leader=leader)
+                )
+    return out
 
 
 # ---------------------------------------------------------------- bootstrap sobre corridas
@@ -255,6 +320,142 @@ def paired_bootstrap(
     return cluster_bootstrap(
         {race: a[race] - b[race] for race in shared}, n_boot=n_boot, alpha=alpha, seed=seed
     )
+
+
+# ---------------------------------------------------------------- calibração e veredito
+
+
+# Faixas pensadas para o que o Monte Carlo produz: a maioria dos pilotos tem probabilidade perto de
+# 0
+# e uns poucos perto de 1, então as faixas são finas nas pontas.
+CALIBRATION_EDGES = (0.0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.7, 0.9, 1.0 + 1e-9)
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationBin:
+    low: float
+    high: float
+    n: int  # pares (piloto, volta) na faixa
+    n_races: int  # corridas que contribuem: o tamanho efetivo, e não `n`
+    mean_predicted: float | None
+    observed: Interval | None  # a frequência observada e o intervalo, por bootstrap sobre corridas
+
+
+def calibration_curve(
+    scores: Sequence[LapScore],
+    kind: str = "win",
+    edges: Sequence[float] = CALIBRATION_EDGES,
+    *,
+    n_boot: int = DEFAULT_BOOTSTRAP,
+    seed: int = 0,
+) -> list[CalibrationBin]:
+    """Probabilidade prevista média contra a frequência observada, por faixa de probabilidade, com o
+    `n` de cada faixa e o número de corridas que a compõem. Os pares de uma mesma corrida e volta
+    não são independentes (as probabilidades somam 1), nem as voltas entre si: o intervalo da
+    frequência ressorteia CORRIDAS inteiras."""
+    races = sorted({s.race for s in scores})
+    index = {race: i for i, race in enumerate(races)}
+    bins = len(edges) - 1
+    hits = np.zeros((len(races), bins))
+    counts = np.zeros((len(races), bins))
+    total_p = np.zeros((len(races), bins))
+    for score in scores:
+        pairs = score.win_pairs if kind == "win" else score.podium_pairs
+        for p, happened in pairs:
+            b = min(int(np.searchsorted(edges, p, side="right")) - 1, bins - 1)
+            hits[index[score.race], b] += float(happened)
+            counts[index[score.race], b] += 1.0
+            total_p[index[score.race], b] += p
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, max(len(races), 1), size=(n_boot, max(len(races), 1)))
+    out = []
+    for b in range(bins):
+        n = int(counts[:, b].sum())
+        present = int((counts[:, b] > 0).sum())
+        observed = None
+        if n:
+            rate = float(hits[:, b].sum() / counts[:, b].sum())
+            if len(races) > 1:
+                num, den = hits[draws, b].sum(axis=1), counts[draws, b].sum(axis=1)
+                valid = den > 0
+                ratios = num[valid] / den[valid]
+                low, high = np.quantile(ratios, [0.025, 0.975]) if ratios.size else (rate, rate)
+                observed = Interval(rate, float(low), float(high), present)
+            else:
+                observed = Interval(rate, rate, rate, present)
+        out.append(
+            CalibrationBin(
+                float(edges[b]),
+                float(min(edges[b + 1], 1.0)),
+                n,
+                present,
+                float(total_p[:, b].sum() / n) if n else None,
+                observed,
+            )
+        )
+    return out
+
+
+def verdict(difference: Interval | None) -> str:
+    """O que a diferença pareada de Brier (Monte Carlo menos comparador) diz, pela regra congelada:
+    SUPERA se o intervalo fica inteiro abaixo de zero; É PIOR se fica inteiro acima; NÃO SUPERA se
+    contém o zero (o Monte Carlo não é distinguível do comparador, nesta amostra)."""
+    if difference is None:
+        return "sem dados"
+    if difference.high < 0:
+        return "supera"
+    if difference.low > 0:
+        return "é pior"
+    return "não supera"
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressRow:
+    low: float
+    high: float
+    n_races: int
+    model: Interval | None
+    leader: Interval | None
+    uniform: Interval | None
+    versus_leader: Interval | None  # Monte Carlo menos "o líder atual vence", pareado por corrida
+    versus_uniform: Interval | None
+    podium: Interval | None
+
+    @property
+    def verdict_leader(self) -> str:
+        return verdict(self.versus_leader)
+
+    @property
+    def verdict_uniform(self) -> str:
+        return verdict(self.versus_uniform)
+
+
+def progress_rows(
+    scores: Sequence[LapScore], *, bins: int = DEFAULT_BINS, n_boot: int = DEFAULT_BOOTSTRAP
+) -> list[ProgressRow]:
+    """O Brier por faixa de andamento e as diferenças pareadas contra os dois comparadores."""
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    rows = []
+    for lo, hi in zip(edges, edges[1:], strict=False):
+        lo, hi = float(lo), float(hi)
+        model = per_race_mean(scores, "brier_win", low=lo, high=hi)
+        leader = per_race_mean(scores, "leader_brier", low=lo, high=hi)
+        uniform = per_race_mean(scores, "uniform_brier", low=lo, high=hi)
+        podium = per_race_mean(scores, "brier_podium", low=lo, high=hi)
+        rows.append(
+            ProgressRow(
+                lo,
+                hi,
+                len(model),
+                cluster_bootstrap(model, n_boot=n_boot),
+                cluster_bootstrap(leader, n_boot=n_boot),
+                cluster_bootstrap(uniform, n_boot=n_boot),
+                paired_bootstrap(model, leader, n_boot=n_boot),
+                paired_bootstrap(model, uniform, n_boot=n_boot),
+                cluster_bootstrap(podium, n_boot=n_boot),
+            )
+        )
+    return rows
 
 
 # ---------------------------------------------------------------- a população

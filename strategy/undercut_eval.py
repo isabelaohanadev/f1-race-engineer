@@ -254,7 +254,7 @@ class EventResult:
         return normal_cdf(m / (sd * (self.inflation_used if factor is None else factor)))
 
 
-def evaluate_race(
+def evaluate_race_modes(
     rows: Sequence[LapRow],
     total_laps: int,
     *,
@@ -262,26 +262,29 @@ def evaluate_race(
     priors=DEFAULT_PRIORS,
     config: UndercutConfig | None = None,
     variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
-    oracle: bool = True,
     snapshot: str = "tempo",
-) -> tuple[list[EventResult], Counter[str]]:
-    """Avalia cada evento da corrida. `priors` deve ser o `leave_one_out` dela (nunca o padrão).
+    modes: Sequence[bool] = (True,),
+) -> tuple[dict[bool, list[EventResult]], Counter[str]]:
+    """Avalia cada evento da corrida nos modos pedidos (`True` = oráculo, `False` = ao vivo), com UM
+    contexto por evento (os dois modos veem o mesmo estado). `priors` deve ser o `leave_one_out`
+    da corrida.
 
     `snapshot="tempo"` (o padrão): o modelo vê só o que se sabia no INSTANTE em que o atacante
-    completa
-    a volta N (`strategy.snapshot`). `"volta"` é o estado antigo, por contagem de voltas, que dá aos
-    de
-    trás informação de depois desse instante (diagnóstico do vazamento)."""
+    completa a volta N (`strategy.snapshot`). `"volta"` é o estado antigo, por contagem de voltas,
+    que dá aos de trás informação de depois desse instante (diagnóstico do vazamento)."""
     cfg = config or UndercutConfig()
     events, skipped = find_events(rows, total_laps, race=race, config=cfg)
     contexts: dict[tuple[int, int | None], LapContext] = {}  # um ajuste por (volta, instante)
-    results: list[EventResult] = []
+    results: dict[bool, list[EventResult]] = {mode: [] for mode in modes}
     for event in events:
         realized = realized_margin(rows, event)
         if realized is None:
             skipped["sem relógio no fim"] += 1
             continue
         as_of = driver_crossing_ms(rows, event.attacker, event.lap) if snapshot == "tempo" else None
+        if snapshot == "tempo" and as_of is None:
+            skipped["sem relógio do atacante"] += 1  # nunca cair em silêncio no estado antigo
+            continue
         if (event.lap, as_of) not in contexts:
             contexts[(event.lap, as_of)] = build_context(
                 rows,
@@ -293,20 +296,47 @@ def evaluate_race(
                 as_of_ms=as_of,
             )
         ctx = contexts[(event.lap, as_of)]
-        kwargs = (
-            {
-                "new_compound": event.new_compound_a,
-                "rival_new_compound": event.new_compound_r,
-                "horizon_k": event.horizon,
-            }
-            if oracle
-            else {}
-        )
-        assessment = assess_undercut(ctx, event.attacker, event.rival, **kwargs)
-        results.append(
-            EventResult(event, assessment, realized, is_neutralized(rows, event), cfg.sd_inflation)
-        )
+        neutralized = is_neutralized(rows, event)
+        for oracle in modes:
+            kwargs = (
+                {
+                    "new_compound": event.new_compound_a,
+                    "rival_new_compound": event.new_compound_r,
+                    "horizon_k": event.horizon,
+                }
+                if oracle
+                else {}
+            )
+            assessment = assess_undercut(ctx, event.attacker, event.rival, **kwargs)
+            results[oracle].append(
+                EventResult(event, assessment, realized, neutralized, cfg.sd_inflation)
+            )
     return results, skipped
+
+
+def evaluate_race(
+    rows: Sequence[LapRow],
+    total_laps: int,
+    *,
+    race: str,
+    priors=DEFAULT_PRIORS,
+    config: UndercutConfig | None = None,
+    variant: FuelVariant = FuelVariant.ENCOLHIMENTO,
+    oracle: bool = True,
+    snapshot: str = "tempo",
+) -> tuple[list[EventResult], Counter[str]]:
+    """Avalia cada evento da corrida num modo. Ver `evaluate_race_modes`."""
+    results, skipped = evaluate_race_modes(
+        rows,
+        total_laps,
+        race=race,
+        priors=priors,
+        config=config,
+        variant=variant,
+        snapshot=snapshot,
+        modes=(oracle,),
+    )
+    return results[oracle], skipped
 
 
 # ---------------------------------------------------------------- as métricas
