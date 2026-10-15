@@ -183,6 +183,13 @@ class RaceSource:
                     Lap.compound,
                     Lap.position,
                     Lap.completed_at,
+                    # os campos da estratégia (stream de voltas): nulos em corridas antigas
+                    Lap.session_time_ms,
+                    Lap.tyre_life,
+                    Lap.stint,
+                    Lap.pit_in,
+                    Lap.pit_out,
+                    Lap.track_status,
                 )
                 .join(Driver, Driver.id == Lap.driver_id)
                 # Volta sem horário de término não tem lugar na linha do tempo: fica de fora.
@@ -199,6 +206,12 @@ class RaceSource:
                     lap_time_ms=row.lap_time_ms,
                     compound=row.compound,
                     position=row.position,
+                    session_time_ms=row.session_time_ms,
+                    tyre_life=row.tyre_life,
+                    stint=row.stint,
+                    pit_in=row.pit_in,
+                    pit_out=row.pit_out,
+                    track_status=row.track_status,
                 )
                 for row in lap_rows
             ),

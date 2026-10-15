@@ -13,7 +13,7 @@ inteiro: sem ambiguidade de fuso, comparação trivial e é o que o motor usa pa
 
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import ClassVar, Literal
 
@@ -30,6 +30,29 @@ RaceState = Literal["started", "running", "finished"]
 def stream_key(year: int, round_number: int) -> str:
     """Nome do stream de uma corrida: `race:2024:21`."""
     return f"race:{year}:{round_number}"
+
+
+def laps_key(year: int, round_number: int) -> str:
+    """Nome do stream de VOLTAS da corrida: `laps:2024:21`. Só as voltas (e o início e o fim do
+    replay), com os campos que a estratégia lê. É separado do stream principal porque o principal é
+    ~99% posições (110 eventos/s a 1x, ~1.760/s a 16x) e a estratégia precisa de ~1.400 voltas: com
+    um stream só, o consumidor leria e descartaria um milhão de posições para achar as voltas, e o
+    stream principal, que é aparado (MAXLEN), perderia as voltas antigas de que o estado da
+    estratégia depende. O stream de voltas é pequeno e nunca é aparado no meio de uma corrida."""
+    return f"laps:{year}:{round_number}"
+
+
+def laps_stream_of(stream: str) -> str:
+    """`race:2024:21` -> `laps:2024:21`."""
+    prefix, _, rest = stream.partition(":")
+    if prefix != "race" or not rest:
+        raise ValueError(f"não é um stream de corrida: {stream!r}")
+    return f"laps:{rest}"
+
+
+# Versão do formato das entradas do stream de VOLTAS (campo `v`). Campo novo e opcional não muda a
+# versão (o consumidor ignora o que não conhece); mudar o significado ou remover um campo sim.
+LAPS_STREAM_VERSION = 1
 
 
 def to_epoch_ms(moment: datetime) -> int:
@@ -74,6 +97,16 @@ class LapCompletedEvent:
     lap_time_ms: int | None = None  # nulo em volta sem tempo válido (largada, box, bandeira)
     compound: str | None = None
     position: int | None = None
+    # Os campos abaixo SÓ a estratégia usa e só viajam no stream de VOLTAS (`to_lap_fields`): o
+    # stream principal e o WebSocket continuam exatamente como eram (ver STRATEGY_ONLY_FIELDS).
+    # `session_time_ms` é o relógio da sessão ao fim da volta (o mesmo para todos os pilotos), o que
+    # `strategy.snapshot.state_until` usa para saber o que já tinha acontecido num instante.
+    session_time_ms: int | None = None
+    tyre_life: int | None = None
+    stint: int | None = None
+    pit_in: bool | None = None
+    pit_out: bool | None = None
+    track_status: str | None = None
     type: ClassVar[str] = "lap_completed"
 
     def to_fields(self) -> dict[str, str]:
@@ -91,6 +124,45 @@ class LapCompletedEvent:
         if self.position is not None:
             fields["position"] = str(self.position)
         return fields
+
+    def slim(self) -> "LapCompletedEvent":
+        """A mesma volta como o stream PRINCIPAL a entrega: sem os campos da estratégia."""
+        return replace(
+            self,
+            session_time_ms=None,
+            tyre_life=None,
+            stint=None,
+            pit_in=None,
+            pit_out=None,
+            track_status=None,
+        )
+
+    def to_lap_fields(self) -> dict[str, str]:
+        """A entrada do stream de VOLTAS: os campos de sempre mais os da estratégia, e a versão."""
+        fields = self.to_fields() | {"v": str(LAPS_STREAM_VERSION)}
+        if self.session_time_ms is not None:
+            fields["session_time_ms"] = str(self.session_time_ms)
+        if self.tyre_life is not None:
+            fields["tyre_life"] = str(self.tyre_life)
+        if self.stint is not None:
+            fields["stint"] = str(self.stint)
+        if self.pit_in is not None:
+            fields["pit_in"] = "1" if self.pit_in else "0"
+        if self.pit_out is not None:
+            fields["pit_out"] = "1" if self.pit_out else "0"
+        if self.track_status is not None:
+            fields["track_status"] = self.track_status
+        return fields
+
+
+STRATEGY_ONLY_FIELDS = (
+    "session_time_ms",
+    "tyre_life",
+    "stint",
+    "pit_in",
+    "pit_out",
+    "track_status",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +194,15 @@ def _opt_int(fields: Mapping[str, str], name: str) -> int | None:
     return None if value is None else int(value)
 
 
+def _opt_flag(fields: Mapping[str, str], name: str) -> bool | None:
+    value = fields.get(name)
+    if value is None:
+        return None
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} deve ser 0 ou 1, recebi {value!r}")
+    return value == "1"
+
+
 def parse_event(fields: Mapping[str, str]) -> ReplayEvent:
     """Inverso de `to_fields()`: é o que o worker usa para ler uma entrada do stream."""
     try:
@@ -141,6 +222,12 @@ def parse_event(fields: Mapping[str, str]) -> ReplayEvent:
                     lap_time_ms=_opt_int(fields, "lap_time_ms"),
                     compound=fields.get("compound"),
                     position=_opt_int(fields, "position"),
+                    session_time_ms=_opt_int(fields, "session_time_ms"),
+                    tyre_life=_opt_int(fields, "tyre_life"),
+                    stint=_opt_int(fields, "stint"),
+                    pit_in=_opt_flag(fields, "pit_in"),
+                    pit_out=_opt_flag(fields, "pit_out"),
+                    track_status=fields.get("track_status"),
                 )
             case "race_status":
                 return RaceStatusEvent(
@@ -210,4 +297,8 @@ def entry_to_json(entry: StreamEntry) -> str:
     não strings), mais `id` (o ID do stream, para o cliente deduplicar/retomar) e `epoch`."""
     message = {"type": entry.event.type, "id": entry.id, "epoch": entry.epoch}
     message |= asdict(entry.event)
+    if isinstance(entry.event, LapCompletedEvent):
+        # O contrato do WebSocket não muda: os campos da estratégia ficam no stream de voltas.
+        for name in STRATEGY_ONLY_FIELDS:
+            del message[name]
     return json.dumps(message, separators=(",", ":"))

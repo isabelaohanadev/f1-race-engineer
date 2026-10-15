@@ -16,7 +16,13 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
-from replay.events import ReplayEvent
+from replay.events import (
+    STATE_FINISHED,
+    STATE_STARTED,
+    LapCompletedEvent,
+    RaceStatusEvent,
+    ReplayEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,11 @@ logger = logging.getLogger(__name__)
 # (etapas seguintes), em vez de reler eventos antigos.
 STREAM_MAXLEN = 100_000
 
+# O stream de VOLTAS (ver `laps_key` em events.py) guarda só as voltas e o início e o fim do replay:
+# ~1.400 entradas por corrida. 20.000 cobre com folga qualquer corrida (e o stream é apagado a cada
+# replay novo); o corte existe só para o pior caso nunca virar um vazamento de memória.
+LAPS_STREAM_MAXLEN = 20_000
+
 
 class Publisher(Protocol):
     async def reset(self) -> None: ...
@@ -45,18 +56,42 @@ class Publisher(Protocol):
     async def publish_many(self, events: Sequence[ReplayEvent]) -> None: ...
 
 
+def goes_to_laps_stream(event: ReplayEvent) -> bool:
+    """O que o stream de voltas leva: as voltas, e o início e o fim do replay (o `started` traz o
+    total de voltas e é o que avisa o consumidor de que um replay novo começou). As posições e as
+    mudanças de volta do líder (`running`) não: a estratégia as deriva das voltas."""
+    if isinstance(event, LapCompletedEvent):
+        return True
+    return isinstance(event, RaceStatusEvent) and event.state in (STATE_STARTED, STATE_FINISHED)
+
+
 class StreamPublisher:
-    def __init__(self, redis: Redis, stream: str, epoch: int, maxlen: int = STREAM_MAXLEN) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        stream: str,
+        epoch: int,
+        maxlen: int = STREAM_MAXLEN,
+        *,
+        laps_stream: str | None = None,
+        laps_maxlen: int = LAPS_STREAM_MAXLEN,
+    ) -> None:
         self._redis = redis
         self._stream = stream
+        self._laps_stream = laps_stream
         self._epoch = str(epoch)  # grava em TODA entrada: ver StreamEntry em events.py
         self._maxlen = maxlen
+        self._laps_maxlen = laps_maxlen
 
     async def reset(self) -> None:
         """Começa um replay com o stream LIMPO (DEL), para eventos de uma execução anterior não se
         misturarem aos da nova. O DEL também apaga os consumer groups do stream: os workers
-        percebem (NOGROUP) e recriam o grupo, e o evento `started` zera o estado deles."""
-        await self._redis.delete(self._stream)
+        percebem (NOGROUP) e recriam o grupo, e o evento `started` zera o estado deles. O stream
+        de voltas é apagado junto, pelo mesmo motivo (e o consumidor de estratégia também recria o
+        grupo dele)."""
+        await self._redis.delete(
+            *([self._stream] + ([self._laps_stream] if self._laps_stream else []))
+        )
 
     async def publish_many(self, events: Sequence[ReplayEvent]) -> None:
         """Publica o lote numa transação (MULTI/EXEC): ou entra tudo, ou nada.
@@ -75,4 +110,14 @@ class StreamPublisher:
             for event in events:
                 fields = event.to_fields() | {"epoch": self._epoch}
                 pipe.xadd(self._stream, fields, maxlen=self._maxlen, approximate=True)
+                if self._laps_stream is not None and goes_to_laps_stream(event):
+                    # Na MESMA transação: a volta nunca está num stream e não no outro.
+                    lap_fields = (
+                        event.to_lap_fields()
+                        if isinstance(event, LapCompletedEvent)
+                        else event.to_fields()
+                    ) | {"epoch": self._epoch}
+                    pipe.xadd(
+                        self._laps_stream, lap_fields, maxlen=self._laps_maxlen, approximate=True
+                    )
             await pipe.execute()
