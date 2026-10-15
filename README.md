@@ -598,7 +598,7 @@ falhar rápido, e só então os testes, com TimescaleDB e Redis reais como servi
 | **Corrigir o combustível** | Pneu e combustível mexem no tempo com sinais contrários e do mesmo tamanho. Medido: sem correção, 25 das 53 linhas (corrida x composto, 30+ voltas) mostram degradação **negativa**; com o `k` físico são 7, e com o escolhido, 5. A mediana da degradação vai de +0,007 para +0,060 s por volta de idade. |
 | **`k` estimado junto com a degradação, com intercepto por piloto (não por stint)** | Dentro de um stint `volta = idade + constante`: com intercepto por stint o `k` é absorvido pela inclinação da idade e só se identifica `degradação - k`. O que os separa é comparar stints que começam em voltas diferentes, nos vários pilotos da corrida. |
 | **Critério de escolha fixado antes de olhar os resultados** | Estimado se for identificável, preciso (erro-padrão <= metade do físico) e parecido (razão de 0,5 a 2 do físico); senão, o físico, e o motivo fica registrado. **Não foi apertado** depois: virou a variante `estimado` do backtest. |
-| **`k` com encolhimento contínuo, e as três variantes comparadas no backtest** | `k = w * estimado + (1 - w) * físico`, em vez de trocar de fonte num ponto da corrida (um degrau em `k` passa 1 para 1 para a degradação). `w = paradas_vistas/pilotos (no máximo 1) * precisão`; o estimado entra limitado a 0,5x..2x do físico e o erro-padrão é o maior entre o por cluster e o do jackknife por piloto. Só usa voltas até a volta N (testado corrompendo o futuro). `fisico`, `estimado` e `encolhimento` são variantes do backtest da etapa 8, e os números decidem o padrão. |
+| **`k` com encolhimento contínuo, e as três variantes comparadas no backtest** | `k = w * estimado + (1 - w) * físico`, em vez de trocar de fonte num ponto da corrida (um degrau em `k` passa 1 para 1 para a degradação). `w = paradas_vistas/pilotos (no máximo 1) * precisão`; o estimado entra limitado a 0,5x..2x do físico e o erro-padrão é o maior entre o por cluster e o do jackknife por piloto. Só usa voltas até a volta N (testado corrompendo o futuro). `fisico`, `estimado` e `encolhimento` foram comparadas no backtest: **sem diferença detectável** entre elas (`docs/backtest.md`), e o `encolhimento` ficou como principal porque era a regra fixada antes de ver o resultado. |
 | **Degradação por composto e por piloto, com encolhimento e três incertezas separadas** | Um piloto com 8 voltas num composto tem uma inclinação de erro enorme; a média do composto na corrida (de ~20 pilotos) é estável, mas não é "dele". O encolhimento normal-normal pesa as duas pela precisão (`B = t²/(t²+se²)`): com pouco dado vale o composto, com muito vale o piloto. As incertezas saem separadas: `se` (do parâmetro, cai com dados), `σ` (ruído de UMA volta, não cai) e `τ` (variação real da inclinação entre pilotos/stints, estimada pelos próprios dados). Para prever um stint **futuro** vale `sqrt(se² + τ²)`; só com `se` o alerta de undercut ficaria confiante demais. |
 | **Perda no pit medida na própria corrida, só em bandeira verde** | `perda = (volta de entrada + de saída) - 2 x ritmo normal`, com o ritmo normal a média da mediana das voltas limpas antes e depois (a janela simétrica cancela a tendência do combustível: a perda sai a mesma com o `k` certo ou errado, testado). Paradas sob SC/VSC/vermelha ficam fora da estimativa. Devolve a mediana e a dispersão **entre paradas** (o `sd` que importa na margem: atacante e rival pagam paradas independentes e o erro da mediana é o mesmo para os dois). Com poucas paradas encolhe para o prior. |
 | **Constantes que saem dos dados, calculadas sem a corrida avaliada** | `TAU_FALLBACK`, o piso entre compostos e a reserva da perda no pit viram um `Priors`, recalculado por `leave_one_out` deixando a corrida de fora (testado: trocar os números dela por absurdos não muda a constante dela). `earlier_only=True` usa só corridas anteriores no calendário, o que se saberia ao vivo. O padrão (`DEFAULT_PRIORS`) tem as 21 corridas dentro e **não serve a backtest**. |
@@ -736,22 +736,18 @@ Nas 21 corridas secas (`docs/perda-no-pit.md`), 511 paradas em bandeira verde:
   no gerador; a álgebra da incerteza contra uma simulação dos mesmos parâmetros (2%); teste de
   corrupção do futuro com contraprova; 19 mutações, todas derrubam um teste (uma sobreviveu na primeira
   rodada e reforçou um teste).
-- **O que NÃO validei:** **nada contra a realidade**. Tudo é dado sintético, onde o desvio previsto ficou
-  bem acima do erro (|z| < 0,35) porque o mundo sintético não tem espalhamento entre corridas; nos dados
-  reais o desvio inclui 0,46 s por volta líquida de espalhamento entre corridas na diferença de composto,
-  e se isso é demais ou de menos só o backtest diz. O módulo rodou em dado real numa corrida (Miami,
-  voltas 20, 28 e 40), o que mostra que não quebra, não que acerta. O fator de inflação (1,3) é
-  provisório e vem da calibração da inclinação, não da margem; a regra de ultrapassagem (0,7 s/volta de
-  vantagem, 0,7 s de distância) é uma heurística; os outros carros não param no horizonte; o composto
-  seguinte é o mais provável, não o escolhido.
-- **A avaliação nas paradas reais está pronta e ainda não foi rodada** (`python -m strategy.undercut_eval`,
-  protocolo em `docs/undercut.md`; roda no backtest da etapa 8). Cada parada real é um evento, o
-  resultado real sai dos relógios, as constantes saem sem a corrida avaliada e o fator de inflação é
-  calibrado só nas outras corridas. **O viés:** só se observam as paradas que aconteceram, e as equipes
+- **O que NÃO validei antes do backtest:** tudo era dado sintético, onde o desvio previsto ficou bem
+  acima do erro (|z| < 0,35) porque o mundo sintético não tem espalhamento entre corridas. **O backtest
+  mediu** (veja abaixo): o fator de inflação congelado (1,3) deixou o intervalo de 90% da margem cobrindo
+  81%, e os dados pedem 1,87; o valor **não foi mudado** (mudar depois de ver o resultado deixaria de ser
+  uma avaliação limpa). A regra de ultrapassagem (0,7 s/volta de vantagem, 0,7 s de distância) continua
+  heurística; os outros carros não param no horizonte; o composto seguinte é o mais provável, não o
+  escolhido.
+- **A avaliação nas paradas reais rodou no backtest** (resultado na seção "O backtest" abaixo e em
+  `docs/backtest.md`). Cada parada real é um evento, o resultado real sai dos relógios, as constantes
+  saem sem a corrida avaliada. **O viés:** só se observam as paradas que aconteceram, e as equipes
   tendem a parar quando funciona; a precisão medida é otimista, a revocação não é mensurável, e a
-  calibração é condicional a "a equipe decidiu parar". Uma execução numa corrida real (Miami) achou só 2
-  eventos, ambos sob pista não verde: a amostra limpa por corrida é pequena, e o relatório mostra o `n`
-  de cada faixa.
+  calibração é condicional a "a equipe decidiu parar".
 
 #### Safety Car, abandonos e trocas de composto: o que medi (e o que é pouco)
 
@@ -809,10 +805,58 @@ paradas, e o vencedor é quem completa mais voltas e cruza a linha primeiro.
 - **Um erro meu que testes pegaram:** com relógios exatamente iguais, quem ficava na frente era o de
   código alfabeticamente menor (80% para um de dois carros idênticos); e a volta de entrada nos boxes,
   já no relógio, tinha a perda contada duas vezes na volta de saída.
-- **O que NÃO validei:** nenhuma probabilidade contra corridas reais (o avaliador está pronto, com o
-  Brier por volta e **bootstrap sobre corridas**, porque o tamanho efetivo da amostra é o número de
-  corridas e não o de voltas; roda no backtest da etapa 8). O SC depois da volta 10 vem de 3 eventos.
-  VSC e bandeira vermelha ficam de fora.
+- **O que mediu o backtest, e o que NÃO validei:** as probabilidades foram medidas contra 21 corridas
+  reais (seção abaixo, com **bootstrap sobre corridas**, porque o tamanho efetivo da amostra é o número
+  de corridas e não o de voltas) **e o resultado é ruim**: o Monte Carlo não supera "o líder atual
+  vence". O SC depois da volta 10 vem de 3 eventos. VSC e bandeira vermelha ficam de fora.
+
+#### O backtest: o que mediu, e o resultado
+
+Relatório completo e gerado dos números: `docs/backtest.md`. **O resultado é ruim, e está aqui como é.**
+
+- **O que fixei antes de olhar:** o limiar do alerta (0,6 liga, 0,5 desliga), o fator de inflação (1,3),
+  as regras de parada e de ultrapassagem e as demais constantes foram congelados no commit `3be1004`
+  (`docs/backtest-protocolo.md`, `strategy/protocol.py`) **antes** de qualquer execução na população.
+  **Nenhum ajuste foi feito depois do resultado** (seria listado como "ajuste pós-resultado" no
+  relatório); o que foi feito depois é análise e está separado (`docs/backtest-diagnostico.md`).
+- **Como mede:** leave-one-race-out nas 21 corridas secas (as constantes de cada uma saem das outras
+  20); a britânica, o Canadá e o Brasil à parte, sem intervalo (uma corrida cada, fora do domínio do
+  modelo). A verdade é a ordem na pista. O estado é o que se saberia **no instante em que o líder completa
+  a volta N** (`strategy/snapshot.py`, `state_until`, função pura que a etapa 7 reutiliza), não a volta N
+  de cada piloto. A unidade da amostra é a **corrida**: intervalos de 95% por bootstrap sobre as
+  corridas e diferenças pareadas.
+- **O Monte Carlo NÃO supera "o líder atual vence" em nenhuma fase da corrida.** Em 8 das 10 faixas
+  de andamento o intervalo da diferença pareada contém o zero (com 21 corridas não dá para dizer
+  quem é melhor), e nas duas últimas (80% a 100%) o Monte Carlo é **pior**: diferença de Brier +0,151
+  [0,002; 0,314] e +0,085 [0,014; 0,175]. No geral, 0,541 contra 0,425 (+0,116 [−0,048; 0,265]).
+  Contra "todos iguais" (0,945) ele supera nas 10 faixas, o que é uma régua baixa.
+- **O modelo do tempo de volta NÃO supera a persistência** (a mediana das 3 últimas voltas limpas) em
+  nenhum dos 5 horizontes: em 1 volta erra 0,441 s contra 0,397 s (+0,044 [0,024; 0,065]), tem viés de
+  −0,14 a −0,16 s (prevê voltas mais rápidas) e o intervalo de 90% cobre 82% a 86%.
+- **Calibração razoável onde há dado, com o `n` na tabela:** previsto 0,26, observado 30% (117 pares, 20
+  corridas); previsto 0,41, observado 50% (68 pares, 20 corridas); previsto 0,59, observado 58% (43
+  pares, 19 corridas, intervalo de 38% a 79%). Acima de 0,5 são poucos pares: pouco diz.
+- **As três variantes de `k` e a taxa de SC (0,5x, 1x, 2x) não se distinguem** nesta amostra. Não é
+  prova de que não importam, só de que 21 corridas não as separam.
+- **O alerta de undercut, ao vivo:** 18 alertas, 15 certos (precisão 83%, Wilson 61% a 94%), Brier 0,130
+  contra 0,235 de quem prevê a taxa-base. **Otimista pelo viés** (só as paradas que aconteceram) e a
+  revocação não é mensurável. O intervalo de 90% da margem cobre 81%, não 90%. No oráculo (horizonte e
+  compostos reais) a precisão é 67% (47% a 82%).
+- **O desenho antigo me enganaria:** com o estado por contagem de voltas (cada piloto na volta N dele) o
+  Brier da vitória sairia 0,030 melhor [0,011; 0,048] e a precisão do alerta 93% em vez de 83%.
+- **Diagnóstico posterior, não faz parte do backtest** (`docs/backtest-diagnostico.md`): desligo um
+  componente de incerteza por vez, nos mesmos números aleatórios. No meio da corrida o Monte Carlo dá
+  0,54 ao favorito e ele ganha 0,68 (hesita demais); sem a incerteza do modelo ele passa a dar 0,83 e
+  o favorito continua ganhando 0,68 (exagera sem acertar mais). O favorito de uma projeção quase
+  determinística ganha 0,71 e o líder atual, 0,81. A leitura é que a fraqueza está no **ponto do
+  modelo** (nível de ritmo, ultrapassagem, paradas), não na dispersão. São 102 previsões de 21
+  corridas, sem intervalo: **é uma hipótese, nenhuma correção foi aplicada ou testada.**
+- **O que NÃO validei:** nada além deste backtest (uma temporada, 2024; 21 corridas secas); as constantes
+  de cada corrida saem das outras 20 e não só das anteriores no calendário (ao vivo não se saberia);
+  corridas molhadas ou mistas estão fora do domínio do modelo; o limite de silêncio do estado (um
+  carro sem cruzar a linha por mais de 2 voltas típicas é excluído) é uma heurística; e **não sei por
+  que** o Monte Carlo perde para o líder atual no fim da corrida: as ablações só descartam a
+  dispersão, não apontam a causa.
 
 <details>
 <summary><strong>Fase 1: dados e ingestão</strong></summary>
@@ -885,15 +929,19 @@ Inspecionar o GP do Brasil 2024 antes de escrever o mapeamento evitou vários er
 
 **Estratégia (Fase 3, até aqui):**
 
-- **O Monte Carlo ainda não foi medido contra corridas reais.** Está validado por propriedades (soma 1,
-  pódio 3, simetria, determinismo, sem vazamento) e contas de papel. As regras de parada e de
-  ultrapassagem e o desgaste sob SC são heurísticas; o SC no meio da corrida vem de 3 eventos; VSC e
-  bandeira vermelha não entram (`docs/montecarlo.md`).
-- **O alerta de undercut ainda não foi medido contra paradas reais.** Está validado só com dados
-  sintéticos de resposta conhecida e uma execução em uma corrida real. Os limiares (0,6 liga, 0,5
-  desliga), o fator de inflação do desvio (1,3), a regra de ultrapassagem e o horizonte `K` são
-  configurações **não calibradas em dado real**; a avaliação (etapa 8) as ajusta e dirá se o alerta
-  acerta, com o viés de só observar as paradas que aconteceram (`docs/undercut.md`).
+- **O Monte Carlo não supera "o líder atual vence" em nenhuma fase da corrida** (e é pior nos últimos
+  20%) e o modelo do tempo de volta não supera a persistência (`docs/backtest.md`). Por isso **não
+  use a probabilidade de vitória dele como previsão melhor que a posição na pista**. As regras de
+  parada e de ultrapassagem e o desgaste sob SC são heurísticas; o SC depois da volta 10 vem de 3
+  eventos; VSC e bandeira vermelha não entram (`docs/montecarlo.md`).
+- **O alerta de undercut foi medido só nas paradas que aconteceram:** precisão de 83% em 18 alertas
+  (Wilson 61% a 94%) é um valor **otimista**, a revocação não é mensurável, e o intervalo de 90% da
+  margem cobre 81% porque o fator de inflação (1,3, congelado antes) é baixo: os dados pedem 1,87. Os
+  limiares (0,6 liga, 0,5 desliga), a regra de ultrapassagem e o horizonte `K` continuam sem calibração
+  própria (`docs/undercut.md`, `docs/backtest.md`).
+- **O backtest cobre uma temporada (2024), 21 corridas secas** e as constantes de cada corrida vêm das
+  outras 20, não só das anteriores no calendário; a britânica, o Canadá e o Brasil são avaliados à
+  parte (uma corrida cada, sem intervalo).
 - **Degradação negativa no Catar, sem causa conhecida.** Mesmo com o `k` escolhido, HARD e MEDIUM
   saem com degradação negativa no GP do Catar (HARD -0,023 e MEDIUM -0,029 s por volta de idade com
   o `k` físico). Descartei uma hipótese (voltas de safety car inflando a idade do pneu, ver acima) e
@@ -965,8 +1013,10 @@ replay/         motor de replay: fonte (keyset), timeline, engine, publisher, es
                 lock, controle entre processos, manager
 worker/         processo consumidor: grupo de consumo, XAUTOCLAIM, métricas
 strategy/       estratégia (Fase 3): qualidade, limpeza, população, combustível, degradação, pit, ritmo,
-                undercut e a avaliação dele (undercut_eval), history (SC, abandonos, compostos),
-                montecarlo, forecast_runner (executor só-a-última), forecast_eval, metrics
+                snapshot (o estado até o instante t), undercut e a avaliação dele (undercut_eval),
+                history (SC, abandonos, compostos), montecarlo, forecast_runner (executor
+                só-a-última), forecast_eval, laptime_eval, protocol (as constantes congeladas),
+                backtest e backtest_report, diagnostics (pós-resultado), metrics
 ingestion/      loader (FastF1), writer (upsert), pipeline e CLI
 db/             models SQLAlchemy, sessão e migrations Alembic
 scripts/        watch_race.py: cliente de referência do WebSocket

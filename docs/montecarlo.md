@@ -2,7 +2,7 @@
 
 Código: `strategy/montecarlo.py` (simulação), `strategy/history.py` (SC, abandonos e trocas de composto,
 sem a corrida avaliada), `strategy/forecast_runner.py` (executor "só a última") e
-`strategy/forecast_eval.py` (avaliador, **ainda não rodado na população**: vem no backtest da etapa 8).
+`strategy/forecast_eval.py` (avaliador, rodado no backtest: `docs/backtest.md`).
 Testes: `tests/strategy/test_montecarlo.py`, `test_forecast_runner.py`, `test_forecast_eval.py`,
 `test_history.py`.
 
@@ -111,9 +111,13 @@ resultado entregue para `f1_strategy_last_result_age_seconds`.
 
 ## O que NÃO foi validado
 
-- **Nenhuma probabilidade foi medida contra corridas reais.** O avaliador (`forecast_eval.py`) está
-  pronto e testado com dados sintéticos; rodá-lo nas 21 corridas é a etapa 8. Tudo aqui é conta de papel,
-  propriedades (soma 1, pódio 3, simetria, determinismo, sem vazamento) e mutações.
+- **Até o backtest, nenhuma probabilidade tinha sido medida contra corridas reais**, e o que o
+  backtest mediu (`docs/backtest.md`) é ruim: **o Monte Carlo não supera "o líder atual vence" em nenhuma
+  fase da corrida** (8 faixas de 10 não se distinguem, e nas duas últimas, 80% a 100%, ele é pior). O
+  que está acima é conta de papel, propriedades (soma 1, pódio 3, simetria, determinismo, sem vazamento)
+  e mutações: mostram que o código faz o que descrevo, não que a descrição acerta as corridas. O
+  diagnóstico posterior (`docs/backtest-diagnostico.md`) aponta o ponto do modelo, não a dispersão, como
+  fonte do problema; é uma hipótese, sem correção aplicada.
 - **O SC depois da volta 10 vem de 3 eventos** (8 períodos em 7 corridas, 5 deles nas voltas 1 a 7). A
   probabilidade de SC no meio da corrida é muito incerta; a posteriori Gamma carrega isso, mas não o
   cura. As paradas sob SC são 15: a razão de custo (0,58) tem um desvio de ~0,4.
@@ -121,8 +125,9 @@ resultado entregue para `f1_strategy_last_result_age_seconds`.
 - **As regras de parada e de ultrapassagem são heurísticas**, não medidas: equipes decidem por rivais,
   tráfego e estratégia que o ganho de tempo não vê, e só o carro imediatamente à frente segura.
 - **O desgaste sob SC (0,3) é uma heurística**; não se mede desgaste num tempo de volta sob SC.
-- **Snapshot por contagem de voltas:** o estado "na volta N" usa a volta N de cada piloto, e a de um
-  retardatário termina depois de o líder completar a N+1; ao vivo se saberia um pouco menos.
+- **O estado por contagem de voltas** (a volta N de cada piloto) dá ao retardatário informação que o
+  líder ainda não teria completado: ao vivo se saberia menos. O backtest usa o estado **no instante t**
+  (`strategy/snapshot.py`) e mediu o vazamento do outro: Brier 0,030 melhor com a contagem de voltas.
 - **Sem o `k` como incerteza no sorteio:** o `k` cancela entre carros no combustível, mas entra na
   comparação entre pneus; as variantes de `k` são comparadas rodando o simulador com cada uma (mesmos
   números aleatórios), e não sorteando o `k` dentro de uma simulação.
