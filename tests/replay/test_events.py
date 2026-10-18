@@ -3,11 +3,16 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from replay.events import (
+    LAPS_STREAM_VERSION,
     STATE_RUNNING,
     LapCompletedEvent,
     MalformedEvent,
     PositionEvent,
     RaceStatusEvent,
+    StreamEntry,
+    entry_to_json,
+    laps_key,
+    laps_stream_of,
     parse_event,
     stream_key,
     to_epoch_ms,
@@ -74,3 +79,75 @@ def test_naive_datetimes_are_treated_as_utc_and_offsets_are_respected():
 
     assert to_epoch_ms(naive) == to_epoch_ms(naive.replace(tzinfo=UTC))
     assert to_epoch_ms(brasilia) == to_epoch_ms(naive)  # mesmo instante, fusos diferentes
+
+
+# ---------------------------------------------------------------- o stream de voltas
+
+FULL_LAP = LapCompletedEvent(
+    "NOR",
+    7,
+    1_730_649_100_000,
+    87_134,
+    "SOFT",
+    3,
+    session_time_ms=5_432_100,
+    tyre_life=6,
+    stint=2,
+    pit_in=False,
+    pit_out=True,
+    track_status="124",
+)
+
+
+def test_the_laps_stream_has_its_own_key_derived_from_the_race_stream():
+    assert laps_key(2024, 21) == "laps:2024:21"
+    assert laps_stream_of(stream_key(2024, 21)) == laps_key(2024, 21)
+    with pytest.raises(ValueError):
+        laps_stream_of("laps:2024:21")
+
+
+def test_a_lap_survives_the_trip_through_the_laps_stream_with_every_strategy_field():
+    fields = FULL_LAP.to_lap_fields()
+
+    assert all(isinstance(k, str) and isinstance(v, str) for k, v in fields.items())
+    assert fields["v"] == str(LAPS_STREAM_VERSION)
+    assert fields["pit_in"] == "0" and fields["pit_out"] == "1"  # falso não some: é um dado
+    assert parse_event(fields) == FULL_LAP
+
+
+def test_the_main_stream_format_of_a_lap_does_not_change():
+    """O stream principal e o worker de estado seguem lendo o que sempre leram: os campos da
+    estratégia só existem no stream de voltas."""
+    fields = FULL_LAP.to_fields()
+
+    assert set(fields) == {"type", "driver", "lap", "t", "lap_time_ms", "compound", "position"}
+    assert parse_event(fields) == LapCompletedEvent("NOR", 7, 1_730_649_100_000, 87_134, "SOFT", 3)
+
+
+def test_unknown_strategy_fields_are_absent_not_empty_for_old_laps():
+    lap = LapCompletedEvent("ALB", 1, 5, session_time_ms=1_000)  # corrida ingerida sem o resto
+
+    fields = lap.to_lap_fields()
+
+    assert "tyre_life" not in fields and "pit_in" not in fields and "track_status" not in fields
+    assert parse_event(fields) == lap
+
+
+def test_a_flag_that_is_not_zero_or_one_is_malformed():
+    fields = FULL_LAP.to_lap_fields() | {"pit_in": "talvez"}
+
+    with pytest.raises(MalformedEvent):
+        parse_event(fields)
+
+
+def test_the_websocket_message_of_a_lap_does_not_carry_the_strategy_fields():
+    """O contrato do WebSocket não muda por causa do stream de voltas."""
+    entry = StreamEntry("1-0", 3, FULL_LAP)
+
+    import json
+
+    message = json.loads(entry_to_json(entry))
+
+    assert set(message) == {
+        "type", "id", "epoch", "driver", "lap", "t", "lap_time_ms", "compound", "position"
+    }  # fmt: skip

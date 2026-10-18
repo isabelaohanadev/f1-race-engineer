@@ -93,6 +93,16 @@ def random_scenario(rng: random.Random) -> dict:
                         "position": rng.choice([None, rng.randint(1, 20)]),
                     }
                 )
+        for _ in range(rng.randint(0, 4)):  # resultados de estratégia, de voltas e versões variadas
+            events.append(
+                {
+                    "type": "strategy",
+                    "epoch": epoch,
+                    "v": rng.choice([1, 1, 1, 2]),  # a 2 é uma versão que o cliente não conhece
+                    "lap": rng.randint(5, 30),
+                    "reliability": rng.choice(["indicative", "experimental"]),
+                }
+            )
         for lap_number, state in [(1, "started"), (2, "running"), (3, "running"), (3, "finished")]:
             events.append(
                 {
@@ -144,5 +154,139 @@ def test_the_page_and_the_python_client_reach_the_same_state_for_any_event_order
             "race": view.race,
             "cars": view.cars,
             "classification": view.classification,
+            "strategy": view.strategy,
+            "strategyUnsupported": view.strategy_unsupported,
         }
         assert js == python, f"cenário {index}: o JS divergiu do cliente Python"
+
+
+# ---------------------------------------------------------------- o evento `strategy` na página
+
+
+def strategy_message(**overrides) -> dict:
+    from tests.test_strategy_api import document
+
+    return document(30, **overrides)
+
+
+def strategy_views(*cases: dict) -> list[dict]:
+    assert NODE is not None
+    run = subprocess.run(
+        [NODE, str(ROOT / "tests" / "frontend" / "strategy_view.cjs")],
+        input=json.dumps(cases),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(run.stdout)
+
+
+def test_the_page_has_the_strategy_panel_with_both_columns_and_the_honesty_text():
+    html = (ROOT / "frontend" / "index.html").read_text()
+
+    assert 'id="strategy"' in html and "Monte Carlo ao lado de" in html
+    assert "Vence (Monte Carlo)" in html and "Vence (líder atual)" in html
+    assert "RaceView.strategyView(" in html  # a visão é a testada no node, não uma cópia
+
+
+@pytest.mark.skipif(NODE is None, reason="node não está instalado")
+def test_the_view_always_says_the_monte_carlo_did_not_beat_the_current_leader():
+    indicative, experimental = strategy_views(
+        {"strategy": strategy_message(reliability="indicative")},
+        {"strategy": strategy_message(reliability="experimental")},
+    )
+
+    for view in (indicative, experimental):
+        assert "NÃO superou" in view["honesty"] and "líder atual vence" in view["honesty"]
+        assert "docs/backtest.md" in view["honesty"]
+    assert (
+        "EXPERIMENTAL" in experimental["reliabilityText"]
+        and "PIOR" in experimental["reliabilityText"]
+    )
+    assert "não se distinguiu" in indicative["reliabilityText"]
+    assert "EXPERIMENTAL" not in indicative["reliabilityText"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node não está instalado")
+def test_the_view_puts_the_baseline_beside_the_forecast_and_marks_the_leader():
+    (view,) = strategy_views({"strategy": strategy_message()})
+
+    assert view["lapLine"] == "volta 30/66, faltam 36"
+    assert view["rows"][0] == {
+        "driver": "VER", "mc": "62.0%", "baseline": "100.0%", "podium": "97.0%", "leader": True,
+    }  # fmt: skip
+    assert view["rows"][1]["baseline"] == "0.0%" and view["rows"][1]["leader"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node não está instalado")
+def test_the_view_lists_alerts_with_the_selection_bias_note_and_the_track_warnings():
+    alert = {
+        "attacker": "NOR", "rival": "VER", "probability": 0.72, "margin_s": 1.34,
+        "margin_sd_s": 1.2, "horizon_k": 5, "pit_loss_s": 21.0,
+        "attacker_compounds": ["MEDIUM", "HARD"], "rival_compounds": ["MEDIUM", "HARD"],
+        "blocked_by": None,
+    }  # fmt: skip
+    warning = {"code": "virtual_safety_car", "text": "VSC em curso: fora do simulador."}
+    (view,) = strategy_views({"strategy": strategy_message(alerts=[alert], warnings=[warning])})
+
+    assert view["alerts"] == ["NOR sobre VER: p=72.0%, margem +1.3 s (K=5)"]
+    assert "otimista" in view["alertNote"] and "só nas paradas que aconteceram" in view["alertNote"]
+    assert view["warnings"] == ["VSC em curso: fora do simulador."]
+    assert view["inputs"] == "carros que reportaram: 20/20; voltas atrasadas: 0"
+
+
+@pytest.mark.skipif(NODE is None, reason="node não está instalado")
+def test_the_view_says_what_is_missing_instead_of_showing_nothing():
+    nothing, newer_version, newer_but_one_known = strategy_views(
+        {"strategy": None},
+        {"strategy": None, "unsupported": 2},
+        {"strategy": strategy_message(), "unsupported": 2},
+    )
+
+    assert "sem resultado" in nothing["empty"]
+    assert "versão 2" in newer_version["empty"] and "não suportada" in newer_version["empty"]
+    assert "empty" not in newer_but_one_known and newer_but_one_known["unsupported"] is True
+
+
+def run_page(messages: list[dict]) -> dict:
+    assert NODE is not None
+    snapshot = {
+        "type": "snapshot",
+        "as_of": "0-0",
+        "epoch": 3,
+        "race": {},
+        "cars": {},
+        "replay": None,
+    }
+    run = subprocess.run(
+        [NODE, str(ROOT / "tests" / "frontend" / "page_smoke.cjs")],
+        input=json.dumps({"snapshot": snapshot, "messages": messages}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(run.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node não está instalado")
+def test_the_page_script_runs_and_draws_the_strategy_panel_with_a_fake_dom():
+    screen = run_page([strategy_message(reliability="experimental")])
+
+    assert screen["empty"] == "" and screen["bodyHidden"] is False
+    assert "NÃO superou" in screen["honesty"]
+    assert screen["reliabilityClass"] == "reliability experimental"
+    assert screen["lap"] == "volta 30/66, faltam 36"
+    assert screen["rows"][0] == ["VER", "62.0%", "100.0%", "97.0%"]
+    assert screen["leaderRows"][0] == "leader" and screen["alerts"] == ["nenhum alerta ligado"]
+    assert screen["warnings"] == ["pista sem avisos"] and screen["unsupportedHidden"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node não está instalado")
+def test_the_page_keeps_the_empty_state_until_a_result_arrives_and_flags_an_unknown_version():
+    nothing = run_page([])
+    newer = run_page([strategy_message(v=2)])
+
+    assert "sem resultado" in nothing["empty"] and nothing["bodyHidden"] is True
+    assert "versão 2" in newer["empty"] and newer["bodyHidden"] is True

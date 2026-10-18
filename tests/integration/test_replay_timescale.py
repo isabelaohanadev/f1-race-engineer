@@ -23,6 +23,7 @@ from replay.events import (
     LapCompletedEvent,
     PositionEvent,
     RaceStatusEvent,
+    laps_key,
     parse_event,
     stream_key,
 )
@@ -137,7 +138,17 @@ async def test_the_whole_chain_delivers_every_event_once_and_in_order(
 
     stream = [parse_event(f) for _, f in await redis_client.xrange(stream_key(*RACE))]
     reference = await RaceSource.open(session_factory, *RACE, page_size=5000)
-    assert stream == [e async for e in reference.events()]  # nada perdido, duplicado ou trocado
+    expected = [e async for e in reference.events()]
+    # o stream principal entrega as voltas SEM os campos da estratégia (o contrato é o de sempre)
+    assert stream == [e.slim() if isinstance(e, LapCompletedEvent) else e for e in expected]
+    # o stream de voltas leva as voltas inteiras, o início e o fim, na mesma ordem
+    laps_stream = [parse_event(f) for _, f in await redis_client.xrange(laps_key(*RACE))]
+    assert laps_stream == [
+        e
+        for e in expected
+        if isinstance(e, LapCompletedEvent)
+        or (isinstance(e, RaceStatusEvent) and e.state in ("started", "finished"))
+    ]
     assert isinstance(stream[0], RaceStatusEvent) and stream[0].state == "started"
     assert isinstance(stream[-1], RaceStatusEvent) and stream[-1].state == "finished"
     assert sum(isinstance(e, PositionEvent) for e in stream) == 120

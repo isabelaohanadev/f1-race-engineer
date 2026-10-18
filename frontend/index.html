@@ -51,6 +51,16 @@
           white-space: pre-wrap; word-break: break-all; }
     details { margin-top: 12px; }
     summary { cursor: pointer; color: var(--muted); }
+    #strategy { margin-top: 12px; }
+    .honesty { margin: 0 0 8px; padding: 8px 10px; border-left: 3px solid var(--warn); background: var(--bg); }
+    .reliability { margin: 0 0 8px; }
+    .reliability.experimental { color: var(--accent); font-weight: 600; }
+    .reliability.indicative { color: var(--warn); }
+    tr.leader td { font-weight: 600; }
+    #strategy ul { margin: 4px 0 8px; padding-left: 18px; }
+    #strategy .note { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+    #strategy th:nth-child(n+2), #strategy td:nth-child(n+2) { text-align: right; }
+    #strategy th:first-child, #strategy td:first-child { text-align: left; }
   </style>
 </head>
 <body>
@@ -99,6 +109,27 @@
       <pre id="log"></pre>
     </section>
   </main>
+
+  <section class="panel" id="strategy">
+    <h2>Estratégia: Monte Carlo ao lado de “o líder atual vence”</h2>
+    <p id="st-empty" class="muted"></p>
+    <div id="st-body" hidden>
+      <p id="st-honesty" class="honesty"></p>
+      <p id="st-reliability" class="reliability"></p>
+      <p class="muted" id="st-lap"></p>
+      <table>
+        <thead><tr><th>Piloto</th><th>Vence (Monte Carlo)</th><th>Vence (líder atual)</th><th>Pódio (Monte Carlo)</th></tr></thead>
+        <tbody id="st-rows"></tbody>
+      </table>
+      <h2>Alertas de undercut</h2>
+      <ul id="st-alerts"></ul>
+      <p class="note" id="st-alert-note"></p>
+      <h2>Avisos de pista</h2>
+      <ul id="st-warnings"></ul>
+      <p class="note" id="st-inputs"></p>
+      <p class="note" id="st-unsupported" hidden></p>
+    </div>
+  </section>
 
   <details>
     <summary>Snapshot recebido ao conectar</summary>
@@ -208,10 +239,51 @@
         });
         $("standings").replaceChildren(...rows);
 
+        renderStrategy();
+
         const logEl = $("log");
         const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
         logEl.textContent = logLines.join("\n");
         if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      // O resultado de estratégia, pela mesma visão testada no node (race_view.js): só textContent.
+      function renderStrategy() {
+        const model = RaceView.strategyView(view.strategy, view.strategyUnsupported);
+        $("st-empty").textContent = model.empty ?? "";
+        $("st-body").hidden = Boolean(model.empty);
+        if (model.empty) return;
+        $("st-honesty").textContent = model.honesty;
+        const reliability = $("st-reliability");
+        reliability.textContent = model.reliabilityText;
+        reliability.className = "reliability " + model.reliability;
+        $("st-lap").textContent = model.lapLine;
+        const rows = model.rows.map((r) => {
+          const row = document.createElement("tr");
+          if (r.leader) row.className = "leader";
+          for (const value of [r.driver, r.mc, r.baseline, r.podium]) {
+            const cell = document.createElement("td");
+            cell.textContent = value;
+            row.appendChild(cell);
+          }
+          return row;
+        });
+        $("st-rows").replaceChildren(...rows);
+        const items = (list, empty) =>
+          (list.length ? list : [empty]).map((text) => {
+            const item = document.createElement("li");
+            item.textContent = text;
+            return item;
+          });
+        $("st-alerts").replaceChildren(...items(model.alerts, "nenhum alerta ligado"));
+        $("st-alert-note").textContent = model.alertNote;
+        $("st-warnings").replaceChildren(...items(model.warnings, "pista sem avisos"));
+        $("st-inputs").textContent = model.inputs;
+        const unsupported = $("st-unsupported");
+        unsupported.hidden = !model.unsupported;
+        unsupported.textContent = model.unsupported
+          ? `chegou um resultado de uma versão do formato que esta página não entende (${view.strategyUnsupported}); o que está acima é o último que ela entendia.`
+          : "";
       }
 
       async function api(path, body) {

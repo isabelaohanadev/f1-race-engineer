@@ -43,7 +43,7 @@ from replay.control import (
 )
 from replay.engine import ReplayEngine, ReplayStatus
 from replay.errors import InvalidSpeed, ReplayAlreadyRunning, ReplayNotRunning
-from replay.events import stream_key
+from replay.events import laps_stream_of, stream_key
 from replay.lock import DEFAULT_TTL_MS, ReplayLock, lock_key
 from replay.publisher import STREAM_MAXLEN, Publisher, StreamPublisher
 from replay.source import DEFAULT_PAGE_SIZE, RaceSource
@@ -118,7 +118,9 @@ class ReplayManager:
             lambda year, rnd: ReplayLock(redis, lock_key(year, rnd), lock_ttl_ms)
         )
         self._publisher_factory = publisher_factory or (
-            lambda stream, epoch: StreamPublisher(redis, stream, epoch, maxlen)
+            lambda stream, epoch: StreamPublisher(
+                redis, stream, epoch, maxlen, laps_stream=laps_stream_of(stream)
+            )
         )
         self._state: StateRegistry = state or RaceStateStore(redis)
         self._control: ControlPlane = control or RedisControlPlane(redis)

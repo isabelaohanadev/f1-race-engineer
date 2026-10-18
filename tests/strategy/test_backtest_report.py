@@ -309,11 +309,30 @@ def test_the_sensitivity_section_has_one_column_per_rate_and_a_paired_difference
 def test_the_undercut_section_states_the_selection_bias_before_any_number():
     text = section_undercut(outcomes(), FROZEN)
 
-    assert text.index("ressalva do viés") < text.index("Ao vivo")
+    assert text.index("ressalva do viés") < text.index("### Ao vivo")
     assert "precisão é otimista" in text and "revocação não é mensurável" in text
     assert "condicional" in text
-    assert text.index("Ao vivo") < text.index("Oráculo")
+    assert text.index("### Ao vivo") < text.index("### Oráculo")
     assert "rival não parou: 15" in text  # 5 corridas x 3
+
+
+def test_the_undercut_section_says_this_is_the_old_form_and_does_not_hold_for_the_consumer():
+    text = " ".join(section_undercut(outcomes(), FROZEN).split())
+
+    assert "forma ANTIGA do alerta" in text and "instante em que o **atacante** completa" in text
+    assert "docs/undercut-ao-vivo.md" in text and "números desta seção não valem para ela" in text
+    assert text.index("forma ANTIGA") < text.index("ressalva do viés")
+
+
+def test_the_summary_and_the_leakage_table_name_the_undercut_number_as_the_old_form():
+    from strategy.backtest_report import section_summary
+
+    summary = " ".join(section_summary(outcomes(), FROZEN).split())
+    leakage = section_leakage(outcomes(), FROZEN)
+
+    assert "Undercut, forma antiga" in summary and "não vale para o consumidor" in summary
+    assert "Undercut ao vivo" not in summary
+    assert "undercut, forma antiga: alertas / precisão" in leakage
 
 
 def test_the_leakage_section_explains_the_sign_and_shows_both_states():

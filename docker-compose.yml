@@ -163,6 +163,41 @@ services:
     # do BLOCK do XREADGROUP.
     stop_grace_period: 15s
 
+  # Consumidor de estratégia da Fase 3: lê o stream de VOLTAS (laps:{ano}:{etapa}), calcula a cada
+  # volta do líder (Monte Carlo e alerta de undercut, a mesma função do backtest) e grava o resultado
+  # no Redis, de onde a API o serve (GET /races/{y}/{r}/strategy e o evento `strategy` do WebSocket).
+  # DUAS réplicas, mas só UMA calcula: a que segura o lock `strategy:consumer:lock`. A outra fica em
+  # standby e assume em até STRATEGY_LOCK_TTL_MS (10 s) se a ativa morrer, ou na hora num `docker
+  # stop` (o SIGTERM libera o lock). Precisa do Postgres: as constantes (perda no pit, SC, abandonos)
+  # saem do banco, sem a corrida reproduzida.
+  strategy:
+    image: f1-race-engineer:local
+    build: .
+    command: ["python", "-m", "strategy.service"]
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+    environment:
+      <<: *postgres-env
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # /metrics do processo (a idade do último resultado, a duração das simulações, quem é o ativo).
+      STRATEGY_METRICS_PORT: "9109"
+    ports:
+      # Porta do HOST efêmera e só em loopback, como a do worker: com 2 réplicas uma fixa conflitaria.
+      - "127.0.0.1::9109"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # Uma simulação em curso termina em até ~1,3 s e o SIGTERM libera o lock; 15 s é folga.
+    stop_grace_period: 15s
+
 volumes:
   pgdata:
   redisdata:

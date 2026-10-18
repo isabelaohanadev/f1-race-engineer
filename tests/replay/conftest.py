@@ -36,6 +36,7 @@ def seed_race(
     year: int = 2024,
     round_number: int = 21,
     race_id: int = 1,
+    lap_extras: dict[tuple[int, int], dict] | None = None,  # (driver_id, volta) -> colunas a mais
 ) -> None:
     with Session(engine) as s:
         # Pilotos/equipes só na 1ª corrida semeada (o teste pode semear mais de uma).
@@ -68,6 +69,7 @@ def seed_race(
                 lap_time_ms=ms,
                 compound=compound,
                 position=pos,
+                **(lap_extras or {}).get((d, n), {}),
             )
             for d, n, done, ms, compound, pos in laps
         )

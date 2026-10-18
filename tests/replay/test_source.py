@@ -238,3 +238,24 @@ async def test_another_race_in_the_same_database_does_not_leak_in(seed, session_
     positions = [e for e in await collect(session_factory) if isinstance(e, PositionEvent)]
 
     assert [(p.x, p.y) for p in positions] == [(1, 1)]
+
+
+async def test_laps_carry_the_strategy_columns_from_the_database(seed, session_factory):
+    seed(
+        positions=[(VER, at(0), 1, 1)],
+        laps=[(VER, 1, at(100), 90_000, "SOFT", 1), (NOR, 1, at(150), 91_000, "HARD", 2)],
+        lap_extras={
+            (VER, 1): dict(session_time_ms=5_000, tyre_life=2, stint=1, pit_in=False,
+                           pit_out=True, track_status="1"),
+        },
+        total_laps=3,
+    )  # fmt: skip
+
+    events = await collect(session_factory)
+
+    laps = {e.driver: e for e in events if isinstance(e, LapCompletedEvent)}
+    assert (laps["VER"].session_time_ms, laps["VER"].tyre_life, laps["VER"].stint) == (5_000, 2, 1)
+    assert (laps["VER"].pit_in, laps["VER"].pit_out, laps["VER"].track_status) == (False, True, "1")
+    # corrida ingerida antes de existirem as colunas: nulo, não "falso" nem vazio
+    assert laps["NOR"].session_time_ms is None and laps["NOR"].pit_in is None
+    assert laps["NOR"].track_status is None

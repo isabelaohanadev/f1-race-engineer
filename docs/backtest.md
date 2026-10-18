@@ -1,6 +1,6 @@
 # Backtest da Fase 3: previsão do tempo de volta, Monte Carlo e alerta de undercut
 
-Gerado por `python -m strategy.backtest` em 2026-10-15 sobre o commit `62d1510` (21 corridas secas com leave-one-race-out e 3 fora delas; 1497 s de CPU). O protocolo foi **congelado antes** de ver o resultado (`docs/backtest-protocolo.md`).
+Gerado por `python -m strategy.backtest` em 2026-10-15 sobre o commit `38c28f8` (21 corridas secas com leave-one-race-out e 3 fora delas; 1497 s de CPU). O protocolo foi **congelado antes** de ver o resultado (`docs/backtest-protocolo.md`).
 
 ## Resumo
 
@@ -12,7 +12,7 @@ Gerado por `python -m strategy.backtest` em 2026-10-15 sobre o commit `62d1510` 
 
 **Taxa de SC** (Brier contra a taxa de 1x, pareado por corrida): taxa 0.5x: sem diferença detectável; taxa 2x: sem diferença detectável.
 
-**Undercut ao vivo** (74 eventos primários de 115). 18 alertas no limiar de 0.6, 15 deram certo (precisão 83%, Wilson 61% a 94%); Brier 0.130 contra 0.235 de quem prevê sempre a taxa-base; cobertura do intervalo de 90% da margem: 0.81. **Precisão otimista** (só as paradas que aconteceram) e revocação não mensurável.
+**Undercut, forma antiga** (avaliado no instante do atacante, no modo "ao vivo": horizonte e composto previstos; **não vale para o consumidor**, que alerta no instante do líder: `docs/undercut-ao-vivo.md`) (74 eventos primários de 115). 18 alertas no limiar de 0.6, 15 deram certo (precisão 83%, Wilson 61% a 94%); Brier 0.130 contra 0.235 de quem prevê sempre a taxa-base; cobertura do intervalo de 90% da margem: 0.81. **Precisão otimista** (só as paradas que aconteceram) e revocação não mensurável.
 
 **Vazamento do estado por contagem de voltas.** O Brier da vitória com o estado antigo menos o do estado no instante t: -0.030 [-0.048, -0.011] (o estado antigo é mais otimista).
 
@@ -172,11 +172,13 @@ Se os intervalos se sobrepõem e a diferença pareada contém o zero, o resultad
 
 ## 6. O alerta de undercut nas paradas reais
 
+**Esta é a forma ANTIGA do alerta:** avaliado no instante em que o **atacante** completa a volta (`state_at_driver_lap`). O consumidor de estratégia o calcula no instante em que o **líder** completa a volta; essa forma é medida à parte, em `docs/undercut-ao-vivo.md`, e **os números desta seção não valem para ela**. "Ao vivo" abaixo é o MODO do backtest (horizonte e composto previstos, em vez dos reais), não a forma do consumidor.
+
 **A ressalva do viés, antes dos números.** Só se observam as paradas que **aconteceram**, e as equipes tendem a parar quando o undercut funciona. Por isso (1) a taxa de sucesso entre as paradas observadas é maior que a de uma situação qualquer de atacante atrás de rival, (2) a **precisão é otimista** e a **revocação não é mensurável** (o denominador, as situações em que funcionaria e ninguém parou, não existe) e (3) a calibração é **condicional** a "a equipe decidiu parar". O resultado real também depende do que os dois lados fizeram depois.
 
 Eventos descartados na busca (21 corridas): horizonte fora do intervalo: 159, rival em outro stint: 151, volta inicial: 97, rival não parou: 78, paradas na mesma volta: 65, sem rival à frente: 50, parada extra na janela: 6, sem relógio no fim: 1.
 
-### Ao vivo (horizonte e composto previstos; o resultado principal)
+### Ao vivo (horizonte e composto previstos; o resultado principal da forma antiga)
 
 Eventos: 115; primários (sem regra dura de não alertar e sem pista não verde): 74. Alertas no limiar de 0.6: 18 alertas, 15 deram certo (precisão 83%, intervalo de Wilson 61% a 94%).
 
@@ -229,8 +231,8 @@ O estado antigo dava a cada piloto a volta N DELE, o que dá ao retardatário in
 |---|---|---|---|
 | Brier da vitória | 0.541 [0.428, 0.659] | 0.511 [0.410, 0.620] | -0.030 [-0.048, -0.011] |
 | erro do tempo de volta (s) | 0.514 [0.452, 0.584] | 0.506 [0.441, 0.579] | -0.008 [-0.019, 0.003] |
-| undercut: Brier (eventos primários) | 0.130 | 0.145 | - |
-| undercut: alertas / precisão | 18 / 0.83 | 14 / 0.93 | - |
+| undercut, forma antiga: Brier (eventos primários) | 0.130 | 0.145 | - |
+| undercut, forma antiga: alertas / precisão | 18 / 0.83 | 14 / 0.93 | - |
 
 ## 8. A britânica, o Canadá e o Brasil, à parte
 
@@ -268,3 +270,4 @@ Nenhum. Nenhum valor do protocolo foi alterado depois de ver o resultado.
 
 - O cache do backtest era gravado com as classes como `__main__.RaceOutcome` e não podia ser relido por outro processo (defeito do ponto de entrada, corrigido). Os números não mudam: o cache foi convertido e o backtest não foi rodado de novo.
 - `docs/backtest-diagnostico.md`: onde está a hesitação do Monte Carlo, desligando um componente de incerteza por vez nos mesmos números aleatórios. Desligar a incerteza do modelo o deixa super-confiante sem melhorar o acerto do favorito, e a projeção quase determinística acerta o vencedor menos que o líder atual: a fraqueza está no ponto do modelo, não na dispersão. É um diagnóstico: nenhuma correção foi aplicada.
+- O número de precisão do undercut deste relatório é o da FORMA ANTIGA do alerta (avaliado no instante do atacante). O consumidor de estratégia alerta no instante do líder, e essa forma é medida à parte em `docs/undercut-ao-vivo.md`. Mudou só a redação do relatório (e o rótulo das linhas de undercut): nenhum número foi recalculado.

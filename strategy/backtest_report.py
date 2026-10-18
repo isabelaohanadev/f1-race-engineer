@@ -483,6 +483,12 @@ def section_undercut(main: Sequence[RaceOutcome], protocol: Protocol) -> str:
         skipped.update(o.skipped)
     why = ", ".join(f"{k}: {v}" for k, v in skipped.most_common()) or "nenhum"
     return (
+        "**Esta é a forma ANTIGA do alerta:** avaliado no instante em que o **atacante** completa "
+        "a volta (`state_at_driver_lap`). O consumidor de estratégia o calcula no instante em que "
+        "o **líder** completa a volta; essa forma é medida à parte, em "
+        '`docs/undercut-ao-vivo.md`, e **os números desta seção não valem para ela**. "Ao vivo" '
+        "abaixo é o MODO do backtest (horizonte e composto previstos, em vez dos reais), não a "
+        "forma do consumidor.\n\n"
         "**A ressalva do viés, antes dos números.** Só se observam as paradas que "
         "**aconteceram**, e as "
         "equipes tendem a parar quando o undercut funciona. Por isso (1) a taxa de sucesso entre "
@@ -495,7 +501,7 @@ def section_undercut(main: Sequence[RaceOutcome], protocol: Protocol) -> str:
         "equipe decidiu "
         'parar". O resultado real também depende do que os dois lados fizeram depois.\n\n'
         f"Eventos descartados na busca (21 corridas): {why}.\n\n"
-        f"### Ao vivo (horizonte e composto previstos; o resultado principal)\n\n"
+        f"### Ao vivo (horizonte e composto previstos; o resultado principal da forma antiga)\n\n"
         f"{undercut_block(main, LIVE, TEMPO, protocol)}\n"
         f"### Oráculo (horizonte e compostos reais; mede a física do modelo)\n\n"
         f"{undercut_block(main, ORACLE, TEMPO, protocol)}\n"
@@ -535,9 +541,14 @@ def section_leakage(main: Sequence[RaceOutcome], protocol: Protocol) -> str:
             fmt(cluster_bootstrap(mae_v)),
             fmt(paired_bootstrap(mae_v, mae_t)),
         ],
-        ["undercut: Brier (eventos primários)", num(live_t.brier), num(live_v.brier), "-"],
         [
-            "undercut: alertas / precisão",
+            "undercut, forma antiga: Brier (eventos primários)",
+            num(live_t.brier),
+            num(live_v.brier),
+            "-",
+        ],
+        [
+            "undercut, forma antiga: alertas / precisão",
             f"{live_t.alerts} / {num(live_t.precision, 2)}",
             f"{live_v.alerts} / {num(live_v.precision, 2)}",
             "-",
@@ -696,7 +707,10 @@ def section_summary(main: Sequence[RaceOutcome], protocol: Protocol) -> str:
     hits = round((live.precision or 0.0) * live.alerts) if live.alerts else 0
     interval = wilson(hits, live.alerts)
     lines.append(
-        f"**Undercut ao vivo** ({live.n_primary} eventos primários de {live.n_events}). "
+        f'**Undercut, forma antiga** (avaliado no instante do atacante, no modo "ao vivo": '
+        f"horizonte e composto previstos; **não vale para o consumidor**, que alerta no instante "
+        f"do líder: `docs/undercut-ao-vivo.md`) ({live.n_primary} eventos primários de "
+        f"{live.n_events}). "
         + (
             f"{live.alerts} alertas no limiar de {protocol.alert_threshold}, {hits} deram certo "
             f"(precisão {hits / live.alerts:.0%}, Wilson {interval[0]:.0%} a {interval[1]:.0%}); "

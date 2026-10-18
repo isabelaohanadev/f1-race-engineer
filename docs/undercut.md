@@ -2,9 +2,10 @@
 
 Código: `strategy/undercut.py`. Testes: `tests/strategy/test_undercut.py` (com corridas sintéticas
 de ganho e perda conhecidos). A **avaliação contra paradas reais** (`strategy/undercut_eval.py`) rodou
-no backtest e o resultado está em `docs/backtest.md` (seção 6): precisão de 83% em 18 alertas ao vivo
-(otimista pelo viés descrito abaixo), cobertura do intervalo de 90% da margem de 81%. Este documento
-descreve o que o código faz, não o quanto acerta.
+no backtest (`docs/backtest.md`, seção 6), mas mede a **forma antiga** do alerta: no instante em que o
+**atacante** completa a volta. O consumidor de estratégia alerta no instante em que o **líder**
+completa a volta, e essa forma foi medida à parte (`docs/undercut-ao-vivo.md`): **os números do
+backtest não valem para ela.** Este documento descreve o que o código faz, não o quanto acerta.
 
 ## A pergunta
 
@@ -107,8 +108,9 @@ o resultado muda (o teste morde).
 
 - **Até o backtest, nenhuma avaliação contra a realidade.** Tudo acima é dado sintético. **O desvio
   previsto ficou bem acima do erro real no sintético (|z| < 0,35) porque o mundo sintético não tem
-  espalhamento entre corridas.** O backtest (`docs/backtest.md`, seção 6) mediu: com o fator de inflação
-  congelado (1,3) o intervalo de 90% da margem cobre 81%, e os dados pedem 1,87 (no oráculo, 1,31). O
+  espalhamento entre corridas.** O backtest (forma antiga) e a avaliação da forma ao vivo mediram: com o
+  fator de inflação congelado (1,3) o intervalo de 90% da margem fica curto, e os fatores que os dados
+  pedem estão nos relatórios (`docs/backtest.md` seção 6, `docs/undercut-ao-vivo.md`). O
   fator **não foi mudado** depois do resultado.
 - **Um teste de execução em dado real**, numa corrida (Miami, voltas 20, 28 e 40): roda em 0,1–0,2 s por
   volta, as regras duras aparecem (pista não verde na 28, carros nos boxes, poucas voltas). Isso mostra que **não
@@ -123,8 +125,8 @@ o resultado muda (o teste morde).
 - **A diferença de ritmo entre compostos é fraca nestes dados** (ver README). O undercut tende a alertar
   menos por causa disso; se o backtest apontar essa incerteza como gargalo, o caminho é um modelo de
   ritmo com efeito fixo de volta, que não fiz.
-- **O fator de inflação 1,3 foi congelado antes do backtest**, que mostrou ser baixo para o modo ao
-  vivo (cobertura 81%, os dados pedem 1,87). Não foi ajustado, para a avaliação continuar limpa.
+- **O fator de inflação 1,3 foi congelado antes do backtest**, que mostrou ser baixo (nas duas formas,
+  a antiga e a ao vivo). Não foi ajustado, para a avaliação continuar limpa.
 
 ## A avaliação nas paradas reais (rodou no backtest)
 

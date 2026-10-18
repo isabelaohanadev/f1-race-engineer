@@ -156,3 +156,65 @@ def test_health_reports_redis_unavailable_against_a_dead_port_without_changing_t
     assert response.status_code == 200  # banco ok => 200, mesmo com o Redis fora
     assert response.json()["status"] == "degraded"
     assert response.json()["checks"] == {"process": "ok", "database": "ok", "redis": "unavailable"}
+
+
+# ---------------------------------------------------------------- o stream de voltas
+
+LAPS_STREAM = "laps:9999:1"
+
+
+async def test_laps_and_the_start_and_end_of_the_replay_also_go_to_the_laps_stream(
+    redis_client: Redis,
+):
+    lap = LapCompletedEvent(
+        "NOR", 1, 1_500, 87_134, "SOFT", 3, session_time_ms=90_000, pit_in=False
+    )
+    events = [
+        RaceStatusEvent("started", 1, 1_000, 71),
+        PositionEvent("VER", -120, 3400, 1_000),
+        lap,
+        RaceStatusEvent("running", 2, 1_500, 71),  # o líder mudou de volta: derivável das voltas
+        RaceStatusEvent("finished", 71, 9_000, 71),
+    ]
+
+    publisher = StreamPublisher(redis_client, STREAM, epoch=4, laps_stream=LAPS_STREAM)
+    await publisher.publish_many(events)
+
+    main = [parse_event(f) for _, f in await redis_client.xrange(STREAM)]
+    laps = await redis_client.xrange(LAPS_STREAM)
+    assert main == [e.slim() if isinstance(e, LapCompletedEvent) else e for e in events]
+    assert [parse_event(f) for _, f in laps] == [events[0], lap, events[4]]
+    assert {f["epoch"] for _, f in laps} == {"4"}  # o epoch vai em toda entrada, como no principal
+    assert laps[1][1]["session_time_ms"] == "90000" and laps[1][1]["v"] == "1"
+    assert "session_time_ms" not in (await redis_client.xrange(STREAM))[2][1]
+
+
+async def test_without_a_laps_stream_the_publisher_behaves_as_before(redis_client: Redis):
+    await StreamPublisher(redis_client, STREAM, epoch=1).publish_many(
+        [LapCompletedEvent("NOR", 1, 1_500)]
+    )
+
+    assert await redis_client.exists(STREAM) == 1
+    assert await redis_client.exists(LAPS_STREAM) == 0
+
+
+async def test_reset_deletes_both_streams(redis_client: Redis):
+    publisher = StreamPublisher(redis_client, STREAM, epoch=1, laps_stream=LAPS_STREAM)
+    await publisher.publish_many([LapCompletedEvent("NOR", 1, 1_500)])
+    await redis_client.xgroup_create(LAPS_STREAM, "strategy", id="0")
+
+    await publisher.reset()
+
+    assert await redis_client.exists(STREAM, LAPS_STREAM) == 0  # grupo do consumidor incluído
+
+
+async def test_the_laps_stream_is_bounded_too(redis_client: Redis):
+    publisher = StreamPublisher(
+        redis_client, STREAM, epoch=1, laps_stream=LAPS_STREAM, laps_maxlen=100
+    )
+    for start in range(0, 2000, 200):
+        await publisher.publish_many(
+            [LapCompletedEvent("VER", i, i) for i in range(start, start + 200)]
+        )
+
+    assert 100 <= await redis_client.xlen(LAPS_STREAM) <= 200

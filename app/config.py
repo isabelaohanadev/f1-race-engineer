@@ -79,3 +79,23 @@ class WorkerSettings(BaseSettings):
 @lru_cache
 def get_worker_settings() -> WorkerSettings:
     return WorkerSettings()
+
+
+class StrategySettings(BaseSettings):
+    """Configuração do consumidor de estratégia (`python -m strategy.service`): STRATEGY_*."""
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_prefix="STRATEGY_")
+
+    # /metrics do consumidor, numa porta própria (0 desliga), como o worker (WORKER_METRICS_PORT).
+    metrics_port: int = 9109
+    # A janela de espera depois que o líder completa a volta (strategy/live.py), em segundos.
+    wait_s: float = 0.3
+    # TTL do lock do consumidor ativo: o standby assume em até este tempo depois de uma queda.
+    lock_ttl_ms: int = 10_000
+    # Simulações por volta (o protocolo do backtest usa 5.000).
+    n_sims: int = 5_000
+
+
+@lru_cache
+def get_strategy_settings() -> StrategySettings:
+    return StrategySettings()

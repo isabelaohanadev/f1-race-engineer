@@ -19,6 +19,7 @@ de (a). Repetições são inofensivas (a atualização é idempotente), buracos 
      até `join_id`. É o que o snapshot pode não ter. Pode repetir eventos que o snapshot já
      refletia: inofensivo.
   d. AO VIVO: a fila do hub (tudo depois de `join_id`).
+Entre o catch-up e o ao vivo vai o último resultado de estratégia do replay atual, se há.
 Cobertura: <= marca d'água está no snapshot; (marca d'água, join_id] vem do catch-up; > join_id vem
 da fila. Nenhum evento fica de fora, e os repetidos são idempotentes no cliente.
 """
@@ -35,13 +36,14 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app import metrics
-from app.deps import get_control, get_hubs, get_redis, get_state_store
+from app.deps import get_control, get_hubs, get_redis, get_state_store, get_strategy_store
 from app.hub import HubRegistry, Subscription
 from app.routers.replay import to_status_out
 from replay.control import RedisControlPlane
 from replay.events import entry_to_json, id_tuple, parse_entry
 from replay.latency import seconds_since
 from replay.state import RaceSnapshot, RaceStateStore
+from strategy.service.results import ResultStore
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +152,7 @@ async def race_websocket(
     store: Annotated[RaceStateStore, Depends(get_state_store)],
     control: Annotated[RedisControlPlane, Depends(get_control)],
     redis: Annotated[Redis, Depends(get_redis)],
+    strategy: Annotated[ResultStore, Depends(get_strategy_store)],
 ) -> None:
     await websocket.accept()
     metrics.WS_CONNECTIONS.inc()
@@ -163,6 +166,12 @@ async def race_websocket(
         await send_with_timeout(websocket, snapshot_json(snapshot, replay, anchor), SEND_TIMEOUT_S)
         async for payload in catch_up(redis, hub.stream, anchor, sub.join_id):  # c
             await send_with_timeout(websocket, payload, SEND_TIMEOUT_S)
+        # O último resultado de estratégia do replay atual (se há): lido DEPOIS de inscrever a fila,
+        # então um resultado novo publicado a partir daí chega também pela fila (o cliente ignora a
+        # repetição: vale o maior `lap` de cada epoch). Não há catch-up do stream de resultados.
+        latest = await strategy.get(year, round_number)
+        if latest is not None:
+            await send_with_timeout(websocket, latest.payload, SEND_TIMEOUT_S)
         await pump(websocket, sub)  # d
     except WebSocketDisconnect:
         pass  # o cliente foi embora: normal

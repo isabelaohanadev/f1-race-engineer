@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from replay.events import LapCompletedEvent, RaceStatusEvent, StreamEntry
 from strategy.laps import LapRow
 
 SLOPES = {"SOFT": 0.12, "MEDIUM": 0.07, "HARD": 0.04}
@@ -161,3 +162,37 @@ def clock_at(rows: list[LapRow], driver: str, lap: int) -> float:
     return (
         next(r.session_time_ms for r in rows if r.driver == driver and r.lap_number == lap) / 1000
     )
+
+
+def lap_event(row: LapRow, *, epoch_base_ms: int = 1_700_000_000_000) -> LapCompletedEvent:
+    """Uma volta como o stream de voltas a entrega: `t` é o horário absoluto (aqui, a base mais o
+    relógio da sessão) e os campos da estratégia vêm junto."""
+    assert row.session_time_ms is not None
+    return LapCompletedEvent(
+        row.driver,
+        row.lap_number,
+        epoch_base_ms + row.session_time_ms,
+        row.lap_time_ms,
+        row.compound,
+        row.position,
+        session_time_ms=row.session_time_ms,
+        tyre_life=row.tyre_life,
+        stint=row.stint,
+        pit_in=row.pit_in,
+        pit_out=row.pit_out,
+        track_status=row.track_status,
+    )
+
+
+def stream_entries(
+    rows: list[LapRow], *, total_laps: int, epoch: int = 1, finished: bool = True
+) -> list[StreamEntry]:
+    """O stream de voltas de uma corrida sintética, na ordem em que um produtor em ordem de tempo
+    o publicaria: o `started`, as voltas por relógio da sessão (desempate pelo piloto) e o
+    `finished`. Os IDs são os do Redis (crescentes)."""
+    ordered = sorted(rows, key=lambda r: (r.session_time_ms or 0, r.driver, r.lap_number))
+    events = [RaceStatusEvent("started", 1, 1_700_000_000_000, total_laps)]
+    events += [lap_event(r) for r in ordered]
+    if finished:
+        events.append(RaceStatusEvent("finished", total_laps, 1_700_009_000_000, total_laps))
+    return [StreamEntry(f"{i + 1}-0", epoch, event) for i, event in enumerate(events)]

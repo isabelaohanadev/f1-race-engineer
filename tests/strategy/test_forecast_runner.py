@@ -351,7 +351,21 @@ def test_the_only_label_is_the_result_never_a_driver_race_or_lap():
         for key in s.labels
     }
 
-    assert labels <= {"result", "le"}  # `le` é o bucket do histograma
+    assert labels <= {"result", "outcome", "le"}  # `le` é o bucket do histograma
+
+
+def test_the_outcome_label_only_takes_the_fixed_values():
+    """O consumidor conta voltas e entregas por `outcome`: poucos valores fixos, nunca piloto,
+    corrida, volta nem ID (a regra de cardinalidade de app/metrics.py)."""
+    values = {
+        s.labels["outcome"]
+        for family in metrics.REGISTRY.collect()
+        if family.name.startswith("f1_strategy")
+        for s in family.samples
+        if "outcome" in s.labels
+    }
+
+    assert values == set(metrics.LAP_OUTCOMES) | set(metrics.DELIVERY_OUTCOMES)
 
 
 def test_the_age_of_the_last_result_is_nan_before_the_first_and_grows_after(clean_metrics):

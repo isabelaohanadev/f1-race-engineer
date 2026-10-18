@@ -22,6 +22,13 @@ eventos para sempre. As alternativas, e por que não:
 A fila comporta ~5,7 s de eventos a 16x (~1.760/s) e ~90 s a 1x; um cliente que fica mais que isso
 sem consumir está de fato fora do ar. (Evolução possível: "conflação", guardar só a ÚLTIMA posição
 de cada piloto e nunca descartar voltas; fica como melhoria, e a política simples já é segura.)
+
+O EVENTO `strategy` (Fase 3). O mesmo leitor segue DOIS streams num único XREAD: o da corrida e o de
+resultados de estratégia (strategy/service/results.py), cada um com o seu cursor. Um resultado de
+estratégia entra na MESMA fila de cada cliente, então a ordem relativa entre voltas e estratégia é
+a de chegada ao hub e a política do cliente lento é uma só. O cliente que entra no meio recebe o
+último resultado do armazém depois do snapshot (app/routers/ws.py); o stream de resultados não tem
+catch-up porque um resultado novo substitui o antigo.
 """
 
 import asyncio
@@ -35,6 +42,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from replay.events import MalformedEvent, entry_to_json, id_ms, parse_entry, stream_key
+from strategy.service.results import events_key, strategy_entry_to_json
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +103,12 @@ class RaceHub:
         self._redis = redis
         self.year, self.round_number = year, round_number
         self._stream = stream_key(year, round_number)
+        self._strategy_stream = events_key(year, round_number)
         self._queue_size = queue_size
         self._on_empty = on_empty
         self._subs: set[Subscription] = set()
         self._last_id = "0-0"  # o último ID já repassado aos clientes
+        self._last_strategy_id = "0-0"  # o mesmo, no stream de resultados de estratégia
         self._ready = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self.closed = False
@@ -116,8 +126,9 @@ class RaceHub:
     def clients(self) -> int:
         return len(self._subs)
 
-    def mark_ready(self, last_id: str) -> None:
+    def mark_ready(self, last_id: str, strategy_last_id: str = "0-0") -> None:
         self._last_id = last_id
+        self._last_strategy_id = strategy_last_id
         self._ready.set()
 
     # ------------------------------------------------------------ clientes
@@ -156,21 +167,41 @@ class RaceHub:
                     sub.close(overflowed=True)
                     self.stats.dropped_slow += 1
 
+    def dispatch_strategy(self, entries: list[tuple[str, dict[str, str]]]) -> None:
+        """Repassa resultados de estratégia aos clientes (síncrono, como `dispatch`)."""
+        for entry_id, fields in entries:
+            self._last_strategy_id = entry_id
+            try:
+                payload = strategy_entry_to_json(entry_id, fields)
+            except (KeyError, ValueError):
+                logger.warning("Resultado de estratégia ilegível ignorado: %s", entry_id)
+                continue
+            self.stats.dispatched += 1
+            published_ms = id_ms(entry_id)
+            for sub in list(self._subs):
+                if not sub.offer(payload, published_ms):
+                    self._subs.discard(sub)
+                    sub.close(overflowed=True)
+                    self.stats.dropped_slow += 1
+
     # ------------------------------------------------------------ o leitor
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._read_loop(), name=f"hub-{self._stream}")
 
-    async def _current_last_id(self) -> str:
+    async def _current_last_id(self, stream: str) -> str:
         assert self._redis is not None
-        newest = await self._redis.xrevrange(self._stream, count=1)
+        newest = await self._redis.xrevrange(stream, count=1)
         return newest[0][0] if newest else "0-0"
 
     async def _read_loop(self) -> None:
         assert self._redis is not None
         while True:  # o ponto de partida: o fim do stream AGORA (o que veio antes é catch-up)
             try:
-                self.mark_ready(await self._current_last_id())
+                self.mark_ready(
+                    await self._current_last_id(self._stream),
+                    await self._current_last_id(self._strategy_stream),
+                )
                 break
             except (RedisError, OSError):
                 logger.warning("Hub %s: Redis indisponível ao iniciar", self._stream, exc_info=True)
@@ -178,15 +209,20 @@ class RaceHub:
         while True:
             try:
                 reply = await self._redis.xread(
-                    {self._stream: self._last_id}, count=READ_COUNT, block=READ_BLOCK_MS
+                    {self._stream: self._last_id, self._strategy_stream: self._last_strategy_id},
+                    count=READ_COUNT,
+                    block=READ_BLOCK_MS,
                 )
             except (RedisError, OSError):
                 # O cliente Redis já tentou de novo (backoff). Não derruba o hub: espera e tenta.
                 logger.warning("Hub %s: falha lendo o stream", self._stream, exc_info=True)
                 await asyncio.sleep(1)
                 continue
-            for _name, entries in reply or []:
-                self.dispatch(entries)
+            for name, entries in reply or []:
+                if name == self._strategy_stream:
+                    self.dispatch_strategy(entries)
+                else:
+                    self.dispatch(entries)
 
     async def close(self) -> None:
         self.closed = True
